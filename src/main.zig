@@ -13,36 +13,26 @@ const io_uring_sqe = linux.io_uring_sqe;
 const errno = @import("errno.zig");
 
 test "Completion complete" {
-    const Ctx = struct {
+    // define Context
+    const Context = struct {
         calls: usize = 0,
 
-        fn callback(self: *@This(), result: Error!os.socket_t) void {
-            _ = result catch unreachable;
+        fn acceptCallback(self: *@This(), result: Error!os.socket_t) void {
+            const res = result catch unreachable;
+            assert(res == 123);
             self.calls += 1;
         }
     };
-    var ctx = Ctx{};
+    var ctx = Context{};
 
-    var completion = Completion{
-        .operation = .{ .accept = .{ .socket = 0, .address = undefined } },
-        .result = 0,
-        .context = &ctx,
-        .callback = (struct {
-            fn callback(completion: *Completion) void {
-                const result = if (completion.result < 0)
-                    errno.toError(@intToEnum(os.E, -completion.result))
-                else
-                    @intCast(os.socket_t, completion.result);
+    // create Completion
+    var completion: Completion = undefined;
+    Completion.accept(&completion, *Context, &ctx, Context.acceptCallback, 0);
+    completion.result = 123;
 
-                @call(.auto, Ctx.callback, .{
-                    @intToPtr(*Ctx, @ptrToInt(completion.context)),
-                    @intToPtr(*const Error!os.socket_t, @ptrToInt(&result)).*,
-                });
-            }
-        }).callback,
-    };
-
-    completion.complete();
+    // complete completion, expect to call acceptCallback
+    var loop = Loop{ .ring = undefined };
+    completion.complete(&loop);
     try testing.expectEqual(@as(usize, 1), ctx.calls);
 }
 
@@ -54,7 +44,7 @@ const Completion = struct {
     operation: Operation,
     result: i32 = undefined,
     context: ?*anyopaque,
-    callback: *const fn (completion: *Completion) void,
+    callback: *const fn (completion: *Completion, loop: *Loop) void,
 
     fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
         switch (completion.operation) {
@@ -86,8 +76,42 @@ const Completion = struct {
         sqe.user_data = @ptrToInt(completion);
     }
 
-    fn complete(completion: *Completion) void {
-        completion.callback(completion);
+    fn complete(completion: *Completion, loop: *Loop) void {
+        completion.callback(completion, loop);
+    }
+
+    fn accept(
+        completion: *Completion,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            result: Error!os.socket_t,
+        ) void,
+        socket: os.socket_t,
+    ) void {
+        completion.* = .{
+            .operation = .{ .accept = .{ .socket = socket } },
+            .context = context,
+            .callback = (struct {
+                fn wrapper(comp: *Completion, loop: *Loop) void {
+                    const result = if (comp.result < 0)
+                        errno.toError(@intToEnum(os.E, -comp.result))
+                    else
+                        @intCast(os.socket_t, comp.result);
+
+                    if (result == Error.InterruptedSystemCall) {
+                        loop.retry(comp);
+                        return;
+                    }
+
+                    callback(
+                        @intToPtr(Context, @ptrToInt(comp.context)),
+                        @intToPtr(*const Error!os.socket_t, @ptrToInt(&result)).*,
+                    );
+                }
+            }).wrapper,
+        };
     }
 };
 
@@ -130,4 +154,9 @@ const Operation = union(enum) {
 
 pub const Loop = struct {
     ring: IO_Uring,
+
+    fn retry(self: *Loop, completion: *Completion) void {
+        _ = self;
+        _ = completion;
+    }
 };
