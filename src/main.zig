@@ -27,7 +27,8 @@ test "Completion complete" {
 
     // create Completion
     var completion: Completion = undefined;
-    Completion.accept(&completion, *Context, &ctx, Context.acceptCallback, 0);
+    //Completion.accept(&completion, *Context, &ctx, Context.acceptCallback, 0);
+    Completion.accept(&completion, &ctx, Context.acceptCallback, 0);
     completion.result = 123;
 
     // complete completion, expect to call acceptCallback
@@ -82,14 +83,14 @@ const Completion = struct {
 
     fn accept(
         completion: *Completion,
-        comptime Context: type,
-        context: Context,
+        context: anytype,
         comptime callback: fn (
-            context: Context,
+            context: @TypeOf(context),
             result: Error!os.socket_t,
         ) void,
         socket: os.socket_t,
     ) void {
+        const Context = @TypeOf(context);
         completion.* = .{
             .operation = .{ .accept = .{ .socket = socket } },
             .context = context,
