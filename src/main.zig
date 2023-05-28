@@ -204,25 +204,29 @@ pub const Loop = struct {
     pub fn accept(
         self: *Loop,
         context: anytype,
-        comptime callback: fn (
-            context: @TypeOf(context),
-            result: Error!os.socket_t,
-        ) void,
+        comptime callback: fn (context: @TypeOf(context), result: Error!os.socket_t) void,
         socket: os.socket_t,
     ) void {
-        var completion = self.completion_pool.create() catch |err| {
+        self.accept_(context, callback, socket) catch |err| {
             callback(context, err);
-            return;
-        };
-        completion.accept(self, context, callback, socket);
-        self.enqueue(completion) catch |err| {
-            self.completion_pool.destroy(completion);
-            callback(context, err);
-            return;
         };
     }
 
-    pub fn enqueue(self: *Loop, completion: *Completion) !void {
+    fn accept_(
+        self: *Loop,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), result: Error!os.socket_t) void,
+        socket: os.socket_t,
+    ) !void {
+        var completion = try self.completion_pool.create(); // get completion from the pool
+        errdefer self.completion_pool.destroy(completion); // return to the pool
+        completion.accept(self, context, callback, socket); // fill with accept information
+        try self.enqueue(completion);
+    }
+
+    /// Put completion into submission queue. If submission queue is full store
+    /// it into unqueued fifo.
+    fn enqueue(self: *Loop, completion: *Completion) !void {
         const sqe = self.ring.get_sqe() catch |err| {
             assert(err == error.SubmissionQueueFull);
             self.active += 1;
@@ -241,8 +245,6 @@ pub const Loop = struct {
 
     pub fn run(self: *Loop, mode: RunMode) !void {
         const wait_nr: u32 = switch (mode) {
-            // until_done is one because we need to wait for at least one
-            // (if we have any).
             .until_done => 1,
             .once => 1,
             .no_wait => 0,
@@ -278,6 +280,7 @@ pub const Loop = struct {
     fn flush_completions(self: *Loop, wait_nr: u32) !u32 {
         var cqes: [256]io_uring_cqe = undefined;
         while (true) {
+            // read completed from completion queue
             const completed = self.ring.copy_cqes(&cqes, wait_nr) catch |err| switch (err) {
                 error.SignalInterrupt => continue,
                 else => return err,
@@ -285,10 +288,13 @@ pub const Loop = struct {
             self.in_kernel -= completed;
             self.active -= completed;
             for (cqes[0..completed]) |cqe| {
+                // call completion callback
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
                 completion.result = cqe.res;
                 completion.complete();
                 // TODO: destroy completion or rearm
+                //
+                self.completion_pool.destroy(completion); // return to the pool
             }
 
             if (completed < cqes.len) return completed;
