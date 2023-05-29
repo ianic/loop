@@ -27,7 +27,7 @@ test "Completion complete" {
             return .disarm;
         }
 
-        fn acceptFailure(self: *Context, _: anyerror, _: ?os.E) void {
+        fn acceptFailure(self: *Context, _: anyerror, _: os.E) void {
             _ = self;
         }
     };
@@ -42,7 +42,7 @@ test "Completion complete" {
 
 test "Completion align" {
     try testing.expectEqual(8, @alignOf(Completion));
-    try testing.expectEqual(144, @sizeOf(Completion));
+    try testing.expectEqual(136, @sizeOf(Completion));
 }
 
 pub const Error = error{
@@ -59,7 +59,6 @@ const Completion = struct {
     operation: Operation,
     context: ?*anyopaque,
     complete: *const fn (completion: *Completion, result: i32) CompleteAction,
-    fail: *const fn (completion: *Completion, err: anyerror) void,
 
     fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
         switch (completion.operation) {
@@ -94,7 +93,7 @@ const Completion = struct {
     fn accept(
         context: anytype,
         comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
         socket: os.socket_t,
     ) Completion {
         const Context = @TypeOf(context);
@@ -111,16 +110,11 @@ const Completion = struct {
                 }
                 return success(ctx, @intCast(os.socket_t, result));
             }
-            fn fail(comp: *Completion, err: anyerror) void {
-                var ctx = @intToPtr(Context, @ptrToInt(comp.context));
-                failure(ctx, err, null);
-            }
         };
         return .{
             .operation = .{ .accept = .{ .socket = socket } },
             .context = context,
             .complete = wrapper.complete,
-            .fail = wrapper.fail,
         };
     }
 };
@@ -207,19 +201,7 @@ pub const Loop = struct {
         self: *Loop,
         context: anytype,
         comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
-        socket: os.socket_t,
-    ) void {
-        self.accept_(context, success, failure, socket) catch |err| {
-            failure(context, err, null);
-        };
-    }
-
-    fn accept_(
-        self: *Loop,
-        context: anytype,
-        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
         socket: os.socket_t,
     ) !void {
         var completion = try self.completion_pool.create(); // get completion from the pool
@@ -299,10 +281,8 @@ pub const Loop = struct {
                         self.completion_pool.destroy(completion);
                     },
                     .rearm => {
-                        self.enqueue(completion) catch |err| {
-                            completion.fail(completion, err);
-                            self.completion_pool.destroy(completion);
-                        };
+                        errdefer self.completion_pool.destroy(completion);
+                        try self.enqueue(completion);
                     },
                 }
             }
@@ -338,14 +318,14 @@ test "accept" {
             return .disarm;
         }
 
-        fn acceptFailure(self: *Self, _: anyerror, _: ?os.E) void {
+        fn acceptFailure(self: *Self, _: anyerror, _: os.E) void {
             _ = self;
         }
     };
     var ctx = Context{};
 
     try testing.expectEqual(@as(usize, 0), loop.active);
-    loop.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
+    try loop.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
     try testing.expectEqual(@as(usize, 1), loop.active);
     const thr = try std.Thread.spawn(.{}, testConnect, .{address});
     try loop.run(.once);
