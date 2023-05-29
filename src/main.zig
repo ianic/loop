@@ -19,27 +19,30 @@ test "Completion complete" {
     const Context = struct {
         calls: usize = 0,
 
-        fn acceptCallback(self: *@This(), result: Error!os.socket_t) void {
-            const res = result catch unreachable;
-            assert(res == 123);
+        const Context = @This();
+
+        fn acceptSuccess(self: *@This(), socket: os.socket_t) CompleteAction {
+            assert(socket == 123);
             self.calls += 1;
+            return .disarm;
+        }
+
+        fn acceptFailure(self: *Context, _: anyerror, _: ?os.E) void {
+            _ = self;
         }
     };
     var ctx = Context{};
 
-    // create Completion
-    var completion: Completion = undefined;
-    Completion.accept(&completion, undefined, &ctx, Context.acceptCallback, 0);
-    completion.result = 123;
+    var completion = Completion.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, 0);
 
     // complete completion, expect to call acceptCallback
-    completion.complete();
+    _ = completion.complete(&completion, 123);
     try testing.expectEqual(@as(usize, 1), ctx.calls);
 }
 
 test "Completion align" {
     try testing.expectEqual(8, @alignOf(Completion));
-    try testing.expectEqual(152, @sizeOf(Completion));
+    try testing.expectEqual(144, @sizeOf(Completion));
 }
 
 pub const Error = error{
@@ -47,14 +50,16 @@ pub const Error = error{
     OutOfMemory,
 } || errno.Error;
 
-const Completion = struct {
-    const Callback = *const fn (completion: *Completion) void;
+const CompleteAction = enum {
+    disarm,
+    rearm,
+};
 
+const Completion = struct {
     operation: Operation,
-    result: i32 = undefined,
     context: ?*anyopaque,
-    callback: Callback,
-    loop: *Loop,
+    complete: *const fn (completion: *Completion, result: i32) CompleteAction,
+    fail: *const fn (completion: *Completion, err: anyerror) void,
 
     fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
         switch (completion.operation) {
@@ -86,43 +91,36 @@ const Completion = struct {
         sqe.user_data = @ptrToInt(completion);
     }
 
-    fn complete(completion: *Completion) void {
-        completion.callback(completion);
-    }
-
     fn accept(
-        completion: *Completion,
-        loop: *Loop,
         context: anytype,
-        comptime callback: fn (
-            context: @TypeOf(context),
-            result: Error!os.socket_t,
-        ) void,
+        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
         socket: os.socket_t,
-    ) void {
+    ) Completion {
         const Context = @TypeOf(context);
-        completion.* = .{
+        const wrapper = struct {
+            fn complete(comp: *Completion, result: i32) CompleteAction {
+                var ctx = @intToPtr(Context, @ptrToInt(comp.context));
+                if (result < 0) {
+                    const ose: os.E = @intToEnum(os.E, result);
+                    if (ose == .INTR) {
+                        return .rearm;
+                    }
+                    failure(ctx, errno.toError(ose), ose);
+                    return .disarm;
+                }
+                return success(ctx, @intCast(os.socket_t, result));
+            }
+            fn fail(comp: *Completion, err: anyerror) void {
+                var ctx = @intToPtr(Context, @ptrToInt(comp.context));
+                failure(ctx, err, null);
+            }
+        };
+        return .{
             .operation = .{ .accept = .{ .socket = socket } },
             .context = context,
-            .loop = loop,
-            .callback = (struct {
-                fn wrapper(comp: *Completion) void {
-                    const result = if (comp.result < 0)
-                        errno.toError(@intToEnum(os.E, -comp.result))
-                    else
-                        @intCast(os.socket_t, comp.result);
-
-                    if (result == Error.InterruptedSystemCall) {
-                        comp.loop.retry(comp);
-                        return;
-                    }
-
-                    callback(
-                        @intToPtr(Context, @ptrToInt(comp.context)),
-                        @intToPtr(*const Error!os.socket_t, @ptrToInt(&result)).*,
-                    );
-                }
-            }).wrapper,
+            .complete = wrapper.complete,
+            .fail = wrapper.fail,
         };
     }
 };
@@ -164,6 +162,15 @@ const Operation = union(enum) {
     },
 };
 
+const CallbackAction = struct {
+    loop: *Loop,
+    completion: *Completion,
+
+    pub fn rearm(self: *CallbackAction) !void {
+        try self.loop.enqueue(self.completion);
+    }
+};
+
 pub const Loop = struct {
     const CompletionPool = std.heap.MemoryPool(Completion);
     const InitOptions = struct {
@@ -196,31 +203,28 @@ pub const Loop = struct {
         self.ring.deinit();
     }
 
-    fn retry(self: *Loop, completion: *Completion) void {
-        _ = self;
-        _ = completion;
-    }
-
     pub fn accept(
         self: *Loop,
         context: anytype,
-        comptime callback: fn (context: @TypeOf(context), result: Error!os.socket_t) void,
+        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
         socket: os.socket_t,
     ) void {
-        self.accept_(context, callback, socket) catch |err| {
-            callback(context, err);
+        self.accept_(context, success, failure, socket) catch |err| {
+            failure(context, err, null);
         };
     }
 
     fn accept_(
         self: *Loop,
         context: anytype,
-        comptime callback: fn (context: @TypeOf(context), result: Error!os.socket_t) void,
+        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: ?os.E) void,
         socket: os.socket_t,
     ) !void {
         var completion = try self.completion_pool.create(); // get completion from the pool
         errdefer self.completion_pool.destroy(completion); // return to the pool
-        completion.accept(self, context, callback, socket); // fill with accept information
+        completion.* = Completion.accept(context, success, failure, socket); // fill with accept information
         try self.enqueue(completion);
     }
 
@@ -229,12 +233,12 @@ pub const Loop = struct {
     fn enqueue(self: *Loop, completion: *Completion) !void {
         const sqe = self.ring.get_sqe() catch |err| {
             assert(err == error.SubmissionQueueFull);
-            self.active += 1;
             try self.unqueued.writeItem(completion);
+            self.active += 1;
             return;
         };
-        self.active += 1;
         completion.prep(sqe);
+        self.active += 1;
     }
 
     const RunMode = enum {
@@ -290,13 +294,18 @@ pub const Loop = struct {
             for (cqes[0..completed]) |cqe| {
                 // call completion callback
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
-                completion.result = cqe.res;
-                completion.complete();
-                // TODO: destroy completion or rearm
-                //
-                self.completion_pool.destroy(completion); // return to the pool
+                switch (completion.complete(completion, cqe.res)) {
+                    .disarm => {
+                        self.completion_pool.destroy(completion);
+                    },
+                    .rearm => {
+                        self.enqueue(completion) catch |err| {
+                            completion.fail(completion, err);
+                            self.completion_pool.destroy(completion);
+                        };
+                    },
+                }
             }
-
             if (completed < cqes.len) return completed;
         }
     }
@@ -323,15 +332,20 @@ test "accept" {
         const Self = @This();
         calls: usize = 0,
 
-        fn acceptCompleted(self: *Self, result: Error!os.socket_t) void {
-            _ = result catch unreachable;
+        fn acceptSuccess(self: *Self, socket: os.socket_t) CompleteAction {
+            _ = socket;
             self.calls += 1;
+            return .disarm;
+        }
+
+        fn acceptFailure(self: *Self, _: anyerror, _: ?os.E) void {
+            _ = self;
         }
     };
     var ctx = Context{};
 
     try testing.expectEqual(@as(usize, 0), loop.active);
-    loop.accept(&ctx, Context.acceptCompleted, listener_socket);
+    loop.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
     try testing.expectEqual(@as(usize, 1), loop.active);
     const thr = try std.Thread.spawn(.{}, testConnect, .{address});
     try loop.run(.once);
