@@ -13,214 +13,203 @@ const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 
 const errno = @import("errno.zig");
+const FIFO = @import("fifo.zig").FIFO;
 
-test "Completion complete" {
-    // define Context
-    const Context = struct {
-        calls: usize = 0,
-
-        const Context = @This();
-
-        fn acceptSuccess(self: *@This(), socket: os.socket_t) CompleteAction {
-            assert(socket == 123);
-            self.calls += 1;
-            return .disarm;
-        }
-
-        fn acceptFailure(self: *Context, _: anyerror, _: os.E) void {
-            _ = self;
-        }
-    };
-    var ctx = Context{};
-
-    var completion = Completion.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, 0);
-
-    // complete completion, expect to call acceptCallback
-    _ = completion.complete(&completion, 123);
-    try testing.expectEqual(@as(usize, 1), ctx.calls);
-}
-
-test "Completion align" {
-    try testing.expectEqual(8, @alignOf(Completion));
-    try testing.expectEqual(136, @sizeOf(Completion));
-}
-
-pub const Error = error{
-    //Canceled,
-    OutOfMemory,
-} || errno.Error;
-
-const CompleteAction = enum {
-    disarm,
-    rearm,
-};
+// TODO:
+// naming Completion => Operation
+//
+// treba li mi u failure oba param i error i os.E kada jedan mogu izvuci iz drugog
+//   neka bude samo os.E, pa neki si klijent misli kako ce to tumaciti, ostavi errno.Error da moze napraviti error
+// nisam bas sretan kako u submit mogu promjeniti args, to mi se cini malo traljavo
+//
+// prouci kada moze dobiti INTR: // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
+//  kaze u enter io_uring
 
 const Completion = struct {
-    operation: Operation,
-    context: ?*anyopaque,
-    complete: *const fn (completion: *Completion, result: i32) CompleteAction,
+    /// This union encodes the set of operations supported as well as their arguments.
+    const Args = union(enum) {
+        accept: struct {
+            socket: os.socket_t,
+            address: os.sockaddr = undefined,
+            address_size: os.socklen_t = @sizeOf(os.sockaddr),
+        },
+        close: struct {
+            fd: os.fd_t,
+        },
+        connect: struct {
+            socket: os.socket_t,
+            address: net.Address,
+        },
+        read: struct {
+            fd: os.fd_t,
+            buffer: []u8,
+            offset: u64,
+        },
+        recv: struct {
+            socket: os.socket_t,
+            buffer: []u8,
+        },
+        send: struct {
+            socket: os.socket_t,
+            buffer: []const u8,
+        },
+        timeout: struct {
+            timespec: os.linux.kernel_timespec,
+        },
+        write: struct {
+            fd: os.fd_t,
+            buffer: []const u8,
+            offset: u64,
+        },
+    };
 
-    fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
-        switch (completion.operation) {
-            .accept => |*op| {
-                linux.io_uring_prep_accept(sqe, op.socket, &op.address, &op.address_size, os.SOCK.CLOEXEC);
+    const State = enum {
+        active,
+        inactive,
+        canceled,
+    };
+
+    next: ?*Completion = null, // used in fifo
+    args: Args,
+    loop: *Loop,
+    context: ?*anyopaque,
+    complete: *const fn (completion: *Completion, ose: os.E, res: i32, flags: u32) void,
+    state: State = .inactive,
+
+    fn prep(self: *Completion, sqe: *io_uring_sqe) void {
+        switch (self.args) {
+            .accept => |*args| {
+                linux.io_uring_prep_accept(sqe, args.socket, &args.address, &args.address_size, os.SOCK.CLOEXEC);
             },
-            .close => |op| {
-                linux.io_uring_prep_close(sqe, op.fd);
+            .close => |args| {
+                linux.io_uring_prep_close(sqe, args.fd);
             },
-            .connect => |*op| {
-                linux.io_uring_prep_connect(sqe, op.socket, &op.address.any, op.address.getOsSockLen());
+            .connect => |*args| {
+                linux.io_uring_prep_connect(sqe, args.socket, &args.address.any, args.address.getOsSockLen());
             },
-            .read => |op| {
-                linux.io_uring_prep_read(sqe, op.fd, op.buffer[0..op.buffer.len], op.offset);
+            .read => |args| {
+                linux.io_uring_prep_read(sqe, args.fd, args.buffer, args.offset);
             },
-            .recv => |op| {
-                linux.io_uring_prep_recv(sqe, op.socket, op.buffer, os.MSG.NOSIGNAL);
+            .recv => |args| {
+                linux.io_uring_prep_recv(sqe, args.socket, args.buffer, os.MSG.NOSIGNAL);
             },
-            .send => |op| {
-                linux.io_uring_prep_send(sqe, op.socket, op.buffer, os.MSG.NOSIGNAL);
+            .send => |args| {
+                linux.io_uring_prep_send(sqe, args.socket, args.buffer, os.MSG.NOSIGNAL);
             },
-            .timeout => |*op| {
-                linux.io_uring_prep_timeout(sqe, &op.timespec, 0, 0);
+            .timeout => |*args| {
+                linux.io_uring_prep_timeout(sqe, &args.timespec, 0, 0);
             },
-            .write => |op| {
-                linux.io_uring_prep_write(sqe, op.fd, op.buffer[0..op.buffer.len], op.offset);
+            .write => |args| {
+                linux.io_uring_prep_write(sqe, args.fd, args.buffer, args.offset);
             },
         }
-        sqe.user_data = @ptrToInt(completion);
+        sqe.user_data = @ptrToInt(self);
     }
 
-    fn accept(
+    pub fn submit(self: *Completion) void {
+        assert(self.state != .active);
+        self.loop.submit(self);
+    }
+
+    const SubmitOptions = struct {
+        buffer: ?[]const u8 = null,
+        offset: ?u64 = null,
+    };
+
+    // use optiojns to change args before submit
+    pub fn submitWith(self: *Completion, opt: SubmitOptions) void {
+        switch (self.args) {
+            .recv => |*args| {
+                assert(opt.offset == null);
+                if (opt.buffer) |buffer| args.buffer = buffer;
+            },
+            .send => |*args| {
+                assert(opt.offset == null);
+                if (opt.buffer) |buffer| args.buffer = buffer;
+            },
+            .read => |*args| {
+                if (opt.buffer) |buffer| args.buffer = buffer;
+                if (opt.offset) |offset| args.offset = offset;
+            },
+            .write => |*args| {
+                if (opt.buffer) |buffer| args.buffer = buffer;
+                if (opt.offset) |offset| args.offset = offset;
+            },
+            _ => {
+                assert(opt.buffer == null);
+                assert(opt.offset == null);
+            },
+        }
+        self.submit();
+    }
+
+    pub fn accept(
+        loop: *Loop,
         context: anytype,
-        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
+        comptime success: fn (context: @TypeOf(context), socket: os.socket_t, completion: *Completion) void,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
         socket: os.socket_t,
     ) Completion {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(comp: *Completion, result: i32) CompleteAction {
-                var ctx = @intToPtr(Context, @ptrToInt(comp.context));
-                if (result < 0) {
-                    const ose: os.E = @intToEnum(os.E, result);
-                    if (ose == .INTR) {
-                        return .rearm;
-                    }
-                    failure(ctx, errno.toError(ose), ose);
-                    return .disarm;
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                switch (ose) {
+                    .SUCCESS => success(ctx, @intCast(os.socket_t, res), completion),
+                    .INTR => completion.submit(),
+                    else => failure(ctx, errno.toError(ose), ose, completion),
                 }
-                return success(ctx, @intCast(os.socket_t, result));
             }
         };
         return .{
-            .operation = .{ .accept = .{ .socket = socket } },
+            .args = .{ .accept = .{ .socket = socket } },
             .context = context,
+            .loop = loop,
             .complete = wrapper.complete,
         };
     }
 };
 
-/// This union encodes the set of operations supported as well as their arguments.
-const Operation = union(enum) {
-    accept: struct {
-        socket: os.socket_t,
-        address: os.sockaddr = undefined,
-        address_size: os.socklen_t = @sizeOf(os.sockaddr),
-    },
-    close: struct {
-        fd: os.fd_t,
-    },
-    connect: struct {
-        socket: os.socket_t,
-        address: net.Address,
-    },
-    read: struct {
-        fd: os.fd_t,
-        buffer: []u8,
-        offset: u64,
-    },
-    recv: struct {
-        socket: os.socket_t,
-        buffer: []u8,
-    },
-    send: struct {
-        socket: os.socket_t,
-        buffer: []const u8,
-    },
-    timeout: struct {
-        timespec: os.linux.kernel_timespec,
-    },
-    write: struct {
-        fd: os.fd_t,
-        buffer: []const u8,
-        offset: u64,
-    },
-};
-
-const CallbackAction = struct {
-    loop: *Loop,
-    completion: *Completion,
-
-    pub fn rearm(self: *CallbackAction) !void {
-        try self.loop.enqueue(self.completion);
-    }
-};
-
 pub const Loop = struct {
-    const CompletionPool = std.heap.MemoryPool(Completion);
     const InitOptions = struct {
         entries: u13 = 256,
     };
-    const Fifo = std.fifo.LinearFifo(*Completion, .Dynamic);
 
     ring: IO_Uring,
-    completion_pool: CompletionPool,
     /// Number of completions submitted to kernel, or waiting to be submitted
-    /// in the unqueued fifo.
+    /// in the submissions queue.
     active: usize = 0,
     /// Number of completions submitted to the kernel.
     in_kernel: usize = 0,
-    /// Operations not yet submitted to the kernel and waiting on available
+    /// Completions not yet submitted to the kernel and waiting on available
     /// space in the submission queue.
-    unqueued: Fifo,
+    submissions: FIFO(Completion) = .{},
 
-    fn init(alloc: Allocator, opt: InitOptions) !Loop {
+    pub fn init(opt: InitOptions) !Loop {
         return .{
             .ring = try IO_Uring.init(opt.entries, 0),
-            .completion_pool = CompletionPool.init(alloc),
-            .unqueued = Fifo.init(alloc),
         };
     }
 
     pub fn deinit(self: *Loop) void {
-        self.unqueued.deinit();
-        self.completion_pool.deinit();
         self.ring.deinit();
     }
 
-    pub fn accept(
-        self: *Loop,
-        context: anytype,
-        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) CompleteAction,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
-        socket: os.socket_t,
-    ) !void {
-        var completion = try self.completion_pool.create(); // get completion from the pool
-        errdefer self.completion_pool.destroy(completion); // return to the pool
-        completion.* = Completion.accept(context, success, failure, socket); // fill with accept information
-        try self.enqueue(completion);
-    }
-
     /// Put completion into submission queue. If submission queue is full store
-    /// it into unqueued fifo.
-    fn enqueue(self: *Loop, completion: *Completion) !void {
+    /// it into submissions fifo.
+    fn submit(self: *Loop, completion: *Completion) void {
+        assert(completion.state != .active);
+        completion.state = .active;
+        self.active += 1;
+        // try to get place in ring submission queue
         const sqe = self.ring.get_sqe() catch |err| {
+            // if queue is full put it into submissions
             assert(err == error.SubmissionQueueFull);
-            try self.unqueued.writeItem(completion);
-            self.active += 1;
+            self.submissions.push(completion);
             return;
         };
         completion.prep(sqe);
-        self.active += 1;
     }
 
     const RunMode = enum {
@@ -239,7 +228,7 @@ pub const Loop = struct {
         while (true) {
             if (self.active == 0) break;
 
-            try self.prep_unqueued();
+            try self.prep_submissions();
             self.in_kernel += try self.ring.submit_and_wait(wait_nr);
             const completed = try self.flush_completions(0);
 
@@ -251,42 +240,36 @@ pub const Loop = struct {
         }
     }
 
-    fn prep_unqueued(self: *Loop) !void {
-        while (self.unqueued.count > 0) {
-            const completion = self.unqueued.peekItem(0);
+    fn prep_submissions(self: *Loop) !void {
+        while (self.submissions.peek()) |completion| {
             const sqe = self.ring.get_sqe() catch |err| {
                 assert(err == error.SubmissionQueueFull);
                 return;
             };
             completion.prep(sqe);
-            self.unqueued.discard(1);
+            _ = self.submissions.pop();
         }
     }
 
     fn flush_completions(self: *Loop, wait_nr: u32) !u32 {
         var cqes: [256]io_uring_cqe = undefined;
+        var completed: u32 = 0;
         while (true) {
             // read completed from completion queue
-            const completed = self.ring.copy_cqes(&cqes, wait_nr) catch |err| switch (err) {
+            const len = self.ring.copy_cqes(&cqes, wait_nr) catch |err| switch (err) {
                 error.SignalInterrupt => continue,
                 else => return err,
             };
-            self.in_kernel -= completed;
-            self.active -= completed;
-            for (cqes[0..completed]) |cqe| {
+            self.in_kernel -= len;
+            self.active -= len;
+            completed += len;
+            for (cqes[0..len]) |cqe| {
                 // call completion callback
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
-                switch (completion.complete(completion, cqe.res)) {
-                    .disarm => {
-                        self.completion_pool.destroy(completion);
-                    },
-                    .rearm => {
-                        errdefer self.completion_pool.destroy(completion);
-                        try self.enqueue(completion);
-                    },
-                }
+                completion.state = .inactive;
+                completion.complete(completion, cqe.err(), cqe.res, cqe.flags);
             }
-            if (completed < cqes.len) return completed;
+            if (len < cqes.len) return completed;
         }
     }
 };
@@ -302,30 +285,59 @@ pub fn listen(address: net.Address) !os.socket_t {
     return listener_socket;
 }
 
+test "Completion accept success/failure callbacks" {
+    // define Context
+    const Context = struct {
+        success_socket: os.socket_t = 0,
+        failure_ose: os.E = .SUCCESS,
+
+        const Context = @This();
+
+        fn acceptSuccess(self: *@This(), socket: os.socket_t, _: *Completion) void {
+            self.success_socket = socket;
+        }
+
+        fn acceptFailure(self: *Context, _: anyerror, ose: os.E, _: *Completion) void {
+            self.failure_ose = ose;
+        }
+    };
+    var ctx = Context{};
+    var loop: Loop = undefined;
+    var completion = Completion.accept(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, 0);
+
+    // test success callback
+    _ = completion.complete(&completion, .SUCCESS, 123, 0);
+    try testing.expectEqual(@as(os.socket_t, 123), ctx.success_socket);
+
+    // test failure callback
+    try testing.expectEqual(os.E.SUCCESS, ctx.failure_ose);
+    _ = completion.complete(&completion, .PERM, 0, 0);
+    try testing.expectEqual(os.E.PERM, ctx.failure_ose);
+}
+
 test "accept" {
     const address = try net.Address.parseIp4("127.0.0.1", 3131);
     const listener_socket = try listen(address);
-    var loop = try Loop.init(testing.allocator, .{});
+    var loop = try Loop.init(.{});
     defer loop.deinit();
 
     const Context = struct {
         const Self = @This();
         calls: usize = 0,
 
-        fn acceptSuccess(self: *Self, socket: os.socket_t) CompleteAction {
+        fn acceptSuccess(self: *Self, socket: os.socket_t, _: *Completion) void {
             _ = socket;
             self.calls += 1;
-            return .disarm;
         }
 
-        fn acceptFailure(self: *Self, _: anyerror, _: os.E) void {
+        fn acceptFailure(self: *Self, _: anyerror, _: os.E, _: *Completion) void {
             _ = self;
         }
     };
     var ctx = Context{};
-
+    var completion: Completion = Completion.accept(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
     try testing.expectEqual(@as(usize, 0), loop.active);
-    try loop.accept(&ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
+    completion.submit();
     try testing.expectEqual(@as(usize, 1), loop.active);
     const thr = try std.Thread.spawn(.{}, testConnect, .{address});
     try loop.run(.once);
