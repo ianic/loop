@@ -112,7 +112,7 @@ const Completion = struct {
     }
 
     const SubmitOptions = struct {
-        buffer: ?[]const u8 = null,
+        buffer: ?[]u8 = null, // TODO: za send je []const u8, pa je ovaj interface malo bezveze
         offset: ?u64 = null,
     };
 
@@ -135,7 +135,7 @@ const Completion = struct {
                 if (opt.buffer) |buffer| args.buffer = buffer;
                 if (opt.offset) |offset| args.offset = offset;
             },
-            _ => {
+            else => {
                 assert(opt.buffer == null);
                 assert(opt.offset == null);
             },
@@ -164,6 +164,62 @@ const Completion = struct {
         };
         return .{
             .args = .{ .accept = .{ .socket = socket } },
+            .context = context,
+            .loop = loop,
+            .complete = wrapper.complete,
+        };
+    }
+
+    pub fn recv(
+        loop: *Loop,
+        context: anytype,
+        comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
+        socket: os.socket_t,
+        buffer: []u8,
+    ) Completion {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                switch (ose) {
+                    .SUCCESS => success(ctx, @intCast(usize, res), completion),
+                    .INTR => completion.submit(),
+                    else => failure(ctx, errno.toError(ose), ose, completion),
+                }
+            }
+        };
+        return .{
+            .args = .{ .recv = .{ .socket = socket, .buffer = buffer } },
+            .context = context,
+            .loop = loop,
+            .complete = wrapper.complete,
+        };
+    }
+
+    pub fn send(
+        loop: *Loop,
+        context: anytype,
+        comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
+        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
+        socket: os.socket_t,
+        buffer: []const u8,
+    ) Completion {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                switch (ose) {
+                    .SUCCESS => success(ctx, @intCast(usize, res), completion),
+                    .INTR => completion.submit(),
+                    else => failure(ctx, errno.toError(ose), ose, completion),
+                }
+            }
+        };
+        return .{
+            .args = .{ .send = .{ .socket = socket, .buffer = buffer } },
             .context = context,
             .loop = loop,
             .complete = wrapper.complete,
@@ -348,5 +404,111 @@ test "accept" {
 
 fn testConnect(address: net.Address) !void {
     var conn = try std.net.tcpConnectToAddress(address);
+    conn.close();
+}
+
+test "echo server" {
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const Server = struct {
+        const Self = @This();
+        loop: *Loop,
+        socket: os.socket_t = undefined,
+
+        // operations
+        accept: Completion = undefined,
+        recv: Completion = undefined,
+        send: Completion = undefined,
+
+        buffer: [8192]u8 = undefined,
+        head: usize = 0,
+        tail: usize = 0,
+
+        const recv_chunk = 7;
+
+        fn acceptSuccess(self: *Self, socket: os.socket_t, _: *Completion) void {
+            self.recv = Completion.recv(self.loop, self, received, failure, socket, &self.buffer);
+            self.recv.submitWith(.{ .buffer = self.buffer[self.tail .. self.tail + recv_chunk] });
+
+            self.send = Completion.send(self.loop, self, sent, failure, socket, &self.buffer);
+        }
+
+        fn received(self: *Self, no_bytes: usize, _: *Completion) void {
+            if (no_bytes == 0) return;
+            self.tail += no_bytes;
+            //std.debug.print("received: {d} {d} {d}\n", .{ no_bytes, self.head, self.tail });
+            self.recv.submitWith(.{ .buffer = self.buffer[self.tail .. self.tail + recv_chunk] });
+            self.sendSubmit();
+        }
+
+        fn sendSubmit(self: *Self) void {
+            if (self.send.state == .active) return;
+            if (self.head >= self.tail) return;
+            //std.debug.print("{d} {d}\n", .{ self.head, self.tail });
+            self.send.submitWith(.{ .buffer = self.buffer[self.head..self.tail] });
+        }
+
+        fn sent(self: *Self, no_bytes: usize, _: *Completion) void {
+            if (no_bytes == 0) return;
+            self.head += no_bytes;
+            self.sendSubmit();
+        }
+
+        fn failure(_: *Self, _: anyerror, _: os.E, _: *Completion) void {
+            unreachable;
+        }
+
+        fn start(self: *Self, address: net.Address) !void {
+            self.socket = try listen(address);
+            self.accept = Completion.accept(self.loop, self, acceptSuccess, failure, self.socket);
+            self.accept.submit();
+        }
+    };
+    const buffer = [_]u8{ '0', '1', '2', '3', '4', '5', '6', '7' } ** (1024 / 8);
+    var server = Server{ .loop = &loop };
+    const address = try net.Address.parseIp4("127.0.0.1", 3132);
+    try server.start(address);
+
+    const thr = try std.Thread.spawn(.{}, testClient, .{ address, &buffer });
+    try loop.run(.until_done);
+    std.debug.print("LOOP DONE\n", .{});
+    try os.shutdown(server.recv.args.recv.socket, .send); // TODO: something more intelignet than this
+    thr.join();
+    try testing.expectEqual(buffer.len, server.tail);
+}
+
+fn testClient(address: net.Address, buffer: []const u8) !void {
+    var conn = try std.net.tcpConnectToAddress(address);
+
+    const Reader = struct {
+        conn: net.Stream,
+        read_buffer: [8196]u8 = undefined,
+        tail: usize = 0,
+
+        fn loop(self: *@This()) !void {
+            std.debug.print("reader looop\n", .{});
+            while (true) {
+                const n = try self.conn.read(self.read_buffer[self.tail..]);
+                std.debug.print("received {d}\n", .{n});
+                if (n == 0) break;
+
+                self.tail += n;
+            }
+        }
+    };
+
+    var rdr = Reader{ .conn = conn };
+    const thr = try std.Thread.spawn(.{}, Reader.loop, .{&rdr});
+
+    var n: usize = 0;
+    while (n < buffer.len) {
+        var m = if (n + 10 > buffer.len) buffer.len else n + 10;
+        //std.debug.print("sending {d} {d}\n", .{ n, m });
+        n += try conn.write(buffer[n..m]);
+    }
+
+    try os.shutdown(conn.handle, .send);
+    thr.join();
     conn.close();
 }
