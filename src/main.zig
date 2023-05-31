@@ -64,17 +64,16 @@ const Completion = struct {
     };
 
     const State = enum {
+        initial,
         active,
-        inactive,
-        canceled,
+        completed,
     };
 
     next: ?*Completion = null, // used in fifo
     args: Args,
-    loop: *Loop,
+    state: State = .initial,
     context: ?*anyopaque,
     complete: *const fn (completion: *Completion, ose: os.E, res: i32, flags: u32) void,
-    state: State = .inactive,
 
     fn prep(self: *Completion, sqe: *io_uring_sqe) void {
         switch (self.args) {
@@ -106,125 +105,133 @@ const Completion = struct {
         sqe.user_data = @ptrToInt(self);
     }
 
-    pub fn submit(self: *Completion) void {
-        assert(self.state != .active);
-        self.loop.submit(self);
-    }
+    const Accept = struct {
+        loop: *Loop,
+        completion: Completion,
 
-    const SubmitOptions = struct {
-        buffer: ?[]u8 = null, // TODO: za send je []const u8, pa je ovaj interface malo bezveze
-        offset: ?u64 = null,
+        pub fn submit(self: *Accept) void {
+            self.loop.submit(&self.completion);
+        }
+
+        pub fn init(
+            loop: *Loop,
+            context: anytype,
+            comptime success: fn (context: @TypeOf(context), socket: os.socket_t, completion: *Completion) void,
+            comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
+            socket: os.socket_t,
+        ) Accept {
+            const Context = @TypeOf(context);
+            const wrapper = struct {
+                fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                    _ = flags;
+                    var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                    switch (ose) {
+                        .SUCCESS => success(ctx, @intCast(os.socket_t, res), completion),
+                        //.INTR => completion.submit(),
+                        else => failure(ctx, errno.toError(ose), ose, completion),
+                    }
+                }
+            };
+            return .{
+                .loop = loop,
+                .completion = .{
+                    .args = .{ .accept = .{ .socket = socket } },
+                    .context = context,
+                    .complete = wrapper.complete,
+                },
+            };
+        }
     };
 
-    // use optiojns to change args before submit
-    pub fn submitWith(self: *Completion, opt: SubmitOptions) void {
-        switch (self.args) {
-            .recv => |*args| {
-                assert(opt.offset == null);
-                if (opt.buffer) |buffer| args.buffer = buffer;
-            },
-            .send => |*args| {
-                assert(opt.offset == null);
-                if (opt.buffer) |buffer| args.buffer = buffer;
-            },
-            .read => |*args| {
-                if (opt.buffer) |buffer| args.buffer = buffer;
-                if (opt.offset) |offset| args.offset = offset;
-            },
-            .write => |*args| {
-                if (opt.buffer) |buffer| args.buffer = buffer;
-                if (opt.offset) |offset| args.offset = offset;
-            },
-            else => {
-                assert(opt.buffer == null);
-                assert(opt.offset == null);
-            },
+    const Send = struct {
+        loop: *Loop,
+        completion: Completion,
+
+        pub fn submit(self: *Send, buffer: []u8) void {
+            self.completion.args.send.buffer = buffer;
+            self.loop.submit(&self.completion);
         }
-        self.submit();
-    }
 
-    pub fn accept(
-        loop: *Loop,
-        context: anytype,
-        comptime success: fn (context: @TypeOf(context), socket: os.socket_t, completion: *Completion) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
-        socket: os.socket_t,
-    ) Completion {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
-                _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
-                switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(os.socket_t, res), completion),
-                    .INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose, completion),
-                }
-            }
-        };
-        return .{
-            .args = .{ .accept = .{ .socket = socket } },
-            .context = context,
-            .loop = loop,
-            .complete = wrapper.complete,
-        };
-    }
+        pub fn active(self: *Send) bool {
+            return self.completion.state == .active;
+        }
 
-    pub fn recv(
-        loop: *Loop,
-        context: anytype,
-        comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
-        socket: os.socket_t,
-        buffer: []u8,
-    ) Completion {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
-                _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
-                switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(usize, res), completion),
-                    .INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose, completion),
-                }
-            }
-        };
-        return .{
-            .args = .{ .recv = .{ .socket = socket, .buffer = buffer } },
-            .context = context,
-            .loop = loop,
-            .complete = wrapper.complete,
-        };
-    }
+        pub fn shutdown(self: *Send) !void {
+            try os.shutdown(self.completion.args.send.socket, .write);
+        }
 
-    pub fn send(
-        loop: *Loop,
-        context: anytype,
-        comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
-        socket: os.socket_t,
-        buffer: []const u8,
-    ) Completion {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
-                _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
-                switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(usize, res), completion),
-                    .INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose, completion),
+        pub fn init(
+            loop: *Loop,
+            context: anytype,
+            comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
+            comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
+            socket: os.socket_t,
+        ) Send {
+            const Context = @TypeOf(context);
+            const wrapper = struct {
+                fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                    _ = flags;
+                    var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                    switch (ose) {
+                        .SUCCESS => success(ctx, @intCast(usize, res), completion),
+                        //.INTR => completion.submit(),
+                        else => failure(ctx, errno.toError(ose), ose, completion),
+                    }
                 }
-            }
-        };
-        return .{
-            .args = .{ .send = .{ .socket = socket, .buffer = buffer } },
-            .context = context,
-            .loop = loop,
-            .complete = wrapper.complete,
-        };
-    }
+            };
+            return .{
+                .loop = loop,
+                .completion = .{
+                    .args = .{ .send = .{ .socket = socket, .buffer = undefined } },
+                    .context = context,
+                    .complete = wrapper.complete,
+                },
+            };
+        }
+    };
+
+    const Recv = struct {
+        loop: *Loop,
+        completion: Completion,
+
+        pub fn submit(self: *Recv, buffer: []u8) void {
+            self.completion.args.recv.buffer = buffer;
+            self.loop.submit(&self.completion);
+        }
+
+        pub fn shutdown(self: *Recv) !void {
+            try os.shutdown(self.completion.args.recv.socket, .send);
+        }
+
+        pub fn init(
+            loop: *Loop,
+            context: anytype,
+            comptime success: fn (context: @TypeOf(context), no_bytes: usize, completion: *Completion) void,
+            comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E, completion: *Completion) void,
+            socket: os.socket_t,
+        ) Recv {
+            const Context = @TypeOf(context);
+            const wrapper = struct {
+                fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                    _ = flags;
+                    var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                    switch (ose) {
+                        .SUCCESS => success(ctx, @intCast(usize, res), completion),
+                        //.INTR => completion.submit(),
+                        else => failure(ctx, errno.toError(ose), ose, completion),
+                    }
+                }
+            };
+            return .{
+                .loop = loop,
+                .completion = .{
+                    .args = .{ .recv = .{ .socket = socket, .buffer = undefined } },
+                    .context = context,
+                    .complete = wrapper.complete,
+                },
+            };
+        }
+    };
 };
 
 pub const Loop = struct {
@@ -322,7 +329,7 @@ pub const Loop = struct {
             for (cqes[0..len]) |cqe| {
                 // call completion callback
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
-                completion.state = .inactive;
+                completion.state = .completed;
                 completion.complete(completion, cqe.err(), cqe.res, cqe.flags);
             }
             if (len < cqes.len) return completed;
@@ -359,15 +366,15 @@ test "Completion accept success/failure callbacks" {
     };
     var ctx = Context{};
     var loop: Loop = undefined;
-    var completion = Completion.accept(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, 0);
+    var accept = Completion.Accept.init(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, 0);
 
     // test success callback
-    _ = completion.complete(&completion, .SUCCESS, 123, 0);
+    _ = accept.completion.complete(&accept.completion, .SUCCESS, 123, 0);
     try testing.expectEqual(@as(os.socket_t, 123), ctx.success_socket);
 
     // test failure callback
     try testing.expectEqual(os.E.SUCCESS, ctx.failure_ose);
-    _ = completion.complete(&completion, .PERM, 0, 0);
+    _ = accept.completion.complete(&accept.completion, .PERM, 0, 0);
     try testing.expectEqual(os.E.PERM, ctx.failure_ose);
 }
 
@@ -391,9 +398,9 @@ test "accept" {
         }
     };
     var ctx = Context{};
-    var completion: Completion = Completion.accept(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
+    var accept = Completion.Accept.init(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
     try testing.expectEqual(@as(usize, 0), loop.active);
-    completion.submit();
+    accept.submit();
     try testing.expectEqual(@as(usize, 1), loop.active);
     const thr = try std.Thread.spawn(.{}, testConnect, .{address});
     try loop.run(.once);
@@ -417,9 +424,9 @@ test "echo server" {
         socket: os.socket_t = undefined,
 
         // operations
-        accept: Completion = undefined,
-        recv: Completion = undefined,
-        send: Completion = undefined,
+        accept: Completion.Accept = undefined,
+        recv: Completion.Recv = undefined,
+        send: Completion.Send = undefined,
 
         buffer: [8192]u8 = undefined,
         head: usize = 0,
@@ -427,26 +434,24 @@ test "echo server" {
 
         const recv_chunk = 7;
 
-        fn acceptSuccess(self: *Self, socket: os.socket_t, _: *Completion) void {
-            self.recv = Completion.recv(self.loop, self, received, failure, socket, &self.buffer);
-            self.recv.submitWith(.{ .buffer = self.buffer[self.tail .. self.tail + recv_chunk] });
+        fn accepted(self: *Self, socket: os.socket_t, _: *Completion) void {
+            self.recv = Completion.Recv.init(self.loop, self, received, failure, socket);
+            self.send = Completion.Send.init(self.loop, self, sent, failure, socket);
 
-            self.send = Completion.send(self.loop, self, sent, failure, socket, &self.buffer);
+            self.recv.submit(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
 
         fn received(self: *Self, no_bytes: usize, _: *Completion) void {
             if (no_bytes == 0) return;
             self.tail += no_bytes;
-            //std.debug.print("received: {d} {d} {d}\n", .{ no_bytes, self.head, self.tail });
-            self.recv.submitWith(.{ .buffer = self.buffer[self.tail .. self.tail + recv_chunk] });
+            self.recv.submit(self.buffer[self.tail .. self.tail + recv_chunk]);
             self.sendSubmit();
         }
 
         fn sendSubmit(self: *Self) void {
-            if (self.send.state == .active) return;
+            if (self.send.active()) return;
             if (self.head >= self.tail) return;
-            //std.debug.print("{d} {d}\n", .{ self.head, self.tail });
-            self.send.submitWith(.{ .buffer = self.buffer[self.head..self.tail] });
+            self.send.submit(self.buffer[self.head..self.tail]);
         }
 
         fn sent(self: *Self, no_bytes: usize, _: *Completion) void {
@@ -461,7 +466,7 @@ test "echo server" {
 
         fn start(self: *Self, address: net.Address) !void {
             self.socket = try listen(address);
-            self.accept = Completion.accept(self.loop, self, acceptSuccess, failure, self.socket);
+            self.accept = Completion.Accept.init(self.loop, self, accepted, failure, self.socket);
             self.accept.submit();
         }
     };
@@ -473,7 +478,7 @@ test "echo server" {
     const thr = try std.Thread.spawn(.{}, testClient, .{ address, &buffer });
     try loop.run(.until_done);
     std.debug.print("LOOP DONE\n", .{});
-    try os.shutdown(server.recv.args.recv.socket, .send); // TODO: something more intelignet than this
+    try server.recv.shutdown();
     thr.join();
     try testing.expectEqual(buffer.len, server.tail);
 }
