@@ -194,7 +194,7 @@ const Send = struct {
     }
 
     pub fn shutdown(self: *Send) !void {
-        self.completion.state = .closed;
+        self.completion.state = .closed; // TODO: go through loop
         try os.shutdown(self.completion.args.send.socket, .send);
     }
 
@@ -216,15 +216,6 @@ const Send = struct {
                 } else {
                     callback(ctx, @intCast(usize, res));
                 }
-
-                // switch (ose) {
-                //     .SUCCESS => if (res == 0)
-                //         callback(ctx, Error.EOF)
-                //     else
-                //         callback(ctx, @intCast(usize, res)),
-                //     //.INTR => completion.submit(),
-                //     else => callback(ctx, errno.toError(ose)),
-                // }
             }
         };
         return .{
@@ -256,9 +247,11 @@ const Recv = struct {
         return self.completion.closed();
     }
 
-    pub fn shutdown(self: *Recv) !void {
-        try os.shutdown(self.completion.args.recv.socket, .recv);
-    }
+    // TODO: do we need recv shutdown
+    // pub fn shutdown(self: *Recv) !void {
+    //     self.completion.state = .closed; // TODO: make loop shutdown
+    //     try os.shutdown(self.completion.args.recv.socket, .recv);
+    // }
 
     pub fn init(
         loop: *Loop,
@@ -278,15 +271,6 @@ const Recv = struct {
                 } else {
                     callback(ctx, @intCast(usize, res));
                 }
-
-                // switch (ose) {
-                //     .SUCCESS => if (res == 0)
-                //         callback(ctx, Error.EOF)
-                //     else
-                //         callback(ctx, @intCast(usize, res)),
-                //     //.INTR => completion.submit(),
-                //     else => callback(ctx, errno.toError(ose)),
-                // }
             }
         };
         return .{
@@ -636,7 +620,6 @@ test "echo server" {
     var client = Client{ .loop = &client_loop, .send_buffer = &buffer, .socket = client_conn.handle };
     client.start();
     const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, Loop.RunMode.until_done });
-    //const thr = try std.Thread.spawn(.{}, testClient, .{ address, &buffer });
 
     try loop.run(.until_done);
     thr.join();
@@ -646,50 +629,9 @@ test "echo server" {
 
     try testing.expect(client.recv.closed());
     try testing.expect(client.send.closed());
-    //std.debug.print("LOOP DONE\n", .{});
-    //try server.send.shutdown();
 
     try testing.expectEqual(buffer.len, server.conn.tail);
     try testing.expectEqual(buffer.len, server.conn.head);
     try testing.expectEqual(buffer.len, client.recv_pos);
     try testing.expectEqualSlices(u8, &buffer, client.recv_buffer[0..client.recv_pos]);
-}
-
-fn testClient(address: net.Address, buffer: []const u8) !void {
-    var conn = try std.net.tcpConnectToAddress(address);
-    try os.shutdown(conn.handle, .recv);
-
-    const Reader = struct {
-        conn: net.Stream,
-        read_buffer: [8196]u8 = undefined,
-        tail: usize = 0,
-
-        fn loop(self: *@This()) !void {
-            //std.debug.print("reader looop\n", .{});
-            while (true) {
-                const n = try self.conn.read(self.read_buffer[self.tail..]);
-                //std.debug.print("received {d}\n", .{n});
-                if (n == 0) break;
-                self.tail += n;
-            }
-        }
-    };
-
-    var rdr = Reader{ .conn = conn };
-    const thr = try std.Thread.spawn(.{}, Reader.loop, .{&rdr});
-
-    var n: usize = 0;
-    while (n < buffer.len) {
-        var m = if (n + 10 > buffer.len) buffer.len else n + 10;
-        //std.debug.print("sending {d} {d}\n", .{ n, m });
-        n += try conn.write(buffer[n..m]);
-        // if (n < 512) {
-        //     conn.close();
-        //     return;
-        // }
-    }
-
-    try os.shutdown(conn.handle, .send);
-    thr.join();
-    conn.close();
 }
