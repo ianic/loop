@@ -106,6 +106,10 @@ const Completion = struct {
     }
 };
 
+const Error = error{
+    EOF,
+} || errno.Error;
+
 const Accept = struct {
     loop: *Loop,
     completion: Completion,
@@ -117,8 +121,7 @@ const Accept = struct {
     pub fn init(
         loop: *Loop,
         context: anytype,
-        comptime success: fn (context: @TypeOf(context), socket: os.socket_t) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
+        comptime callback: fn (context: @TypeOf(context), socket: Error!os.socket_t) void,
         socket: os.socket_t,
     ) Accept {
         const Context = @TypeOf(context);
@@ -127,9 +130,9 @@ const Accept = struct {
                 _ = flags;
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(os.socket_t, res)),
+                    .SUCCESS => callback(ctx, @intCast(os.socket_t, res)),
                     //.INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose),
+                    else => callback(ctx, errno.toError(ose)),
                 }
             }
         };
@@ -158,14 +161,13 @@ const Send = struct {
     }
 
     pub fn shutdown(self: *Send) !void {
-        try os.shutdown(self.completion.args.send.socket, .write);
+        try os.shutdown(self.completion.args.send.socket, .send);
     }
 
     pub fn init(
         loop: *Loop,
         context: anytype,
-        comptime success: fn (context: @TypeOf(context), no_bytes: usize) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
+        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
         socket: os.socket_t,
     ) Send {
         const Context = @TypeOf(context);
@@ -174,9 +176,12 @@ const Send = struct {
                 _ = flags;
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(usize, res)),
+                    .SUCCESS => if (res == 0)
+                        callback(ctx, Error.EOF)
+                    else
+                        callback(ctx, @intCast(usize, res)),
                     //.INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose),
+                    else => callback(ctx, errno.toError(ose)),
                 }
             }
         };
@@ -201,14 +206,13 @@ const Recv = struct {
     }
 
     pub fn shutdown(self: *Recv) !void {
-        try os.shutdown(self.completion.args.recv.socket, .send);
+        try os.shutdown(self.completion.args.recv.socket, .recv);
     }
 
     pub fn init(
         loop: *Loop,
         context: anytype,
-        comptime success: fn (context: @TypeOf(context), no_bytes: usize) void,
-        comptime failure: fn (context: @TypeOf(context), err: anyerror, errno: os.E) void,
+        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
         socket: os.socket_t,
     ) Recv {
         const Context = @TypeOf(context);
@@ -217,9 +221,12 @@ const Recv = struct {
                 _ = flags;
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 switch (ose) {
-                    .SUCCESS => success(ctx, @intCast(usize, res)),
+                    .SUCCESS => if (res == 0)
+                        callback(ctx, Error.EOF)
+                    else
+                        callback(ctx, @intCast(usize, res)),
                     //.INTR => completion.submit(),
-                    else => failure(ctx, errno.toError(ose), ose),
+                    else => callback(ctx, errno.toError(ose)),
                 }
             }
         };
@@ -351,31 +358,31 @@ pub fn listen(address: net.Address) !os.socket_t {
 test "Completion accept success/failure callbacks" {
     // define Context
     const Context = struct {
-        success_socket: os.socket_t = 0,
-        failure_ose: os.E = .SUCCESS,
+        socket: os.socket_t = 0,
+        err: ?anyerror = null,
 
         const Context = @This();
 
-        fn acceptSuccess(self: *@This(), socket: os.socket_t) void {
-            self.success_socket = socket;
-        }
-
-        fn acceptFailure(self: *Context, _: anyerror, ose: os.E) void {
-            self.failure_ose = ose;
+        fn acceptCallback(self: *Context, socket: Error!os.socket_t) void {
+            self.socket = socket catch |err| {
+                self.err = err;
+                return;
+            };
         }
     };
     var ctx = Context{};
     var loop: Loop = undefined;
-    var accept = Accept.init(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, 0);
+    var accept = Accept.init(&loop, &ctx, Context.acceptCallback, 0);
 
     // test success callback
     _ = accept.completion.complete(&accept.completion, .SUCCESS, 123, 0);
-    try testing.expectEqual(@as(os.socket_t, 123), ctx.success_socket);
+    try testing.expectEqual(@as(os.socket_t, 123), ctx.socket);
 
     // test failure callback
-    try testing.expectEqual(os.E.SUCCESS, ctx.failure_ose);
+    try testing.expect(ctx.err == null);
     _ = accept.completion.complete(&accept.completion, .PERM, 0, 0);
-    try testing.expectEqual(os.E.PERM, ctx.failure_ose);
+    try testing.expect(ctx.err != null);
+    try testing.expect(ctx.err.? == Error.OperationNotPermitted);
 }
 
 test "accept" {
@@ -388,17 +395,13 @@ test "accept" {
         const Self = @This();
         calls: usize = 0,
 
-        fn acceptSuccess(self: *Self, socket: os.socket_t) void {
-            _ = socket;
+        fn acceptCallback(self: *Self, socket: Error!os.socket_t) void {
+            _ = socket catch unreachable;
             self.calls += 1;
-        }
-
-        fn acceptFailure(self: *Self, _: anyerror, _: os.E) void {
-            _ = self;
         }
     };
     var ctx = Context{};
-    var accept = Accept.init(&loop, &ctx, Context.acceptSuccess, Context.acceptFailure, listener_socket);
+    var accept = Accept.init(&loop, &ctx, Context.acceptCallback, listener_socket);
     try testing.expectEqual(@as(usize, 0), loop.active);
     accept.submit();
     try testing.expectEqual(@as(usize, 1), loop.active);
@@ -423,7 +426,8 @@ test "echo server" {
     const Server = struct {
         const Self = @This();
         loop: *io.Loop,
-        socket: os.socket_t = undefined,
+        socket: os.socket_t = undefined, // accept socket
+        conn: os.socket_t = undefined, // client connection socket
 
         // operations
         accept: io.Accept = undefined,
@@ -433,18 +437,23 @@ test "echo server" {
         buffer: [8192]u8 = undefined,
         head: usize = 0,
         tail: usize = 0,
+        recv_done: bool = false,
 
         const recv_chunk = 7;
 
-        fn accepted(self: *Self, socket: os.socket_t) void {
-            self.recv = io.Recv.init(self.loop, self, received, failure, socket);
-            self.send = io.Send.init(self.loop, self, sent, failure, socket);
+        fn accepted(self: *Self, socket_: Error!os.socket_t) void {
+            self.conn = socket_ catch unreachable;
+            self.recv = io.Recv.init(self.loop, self, received, self.conn);
+            self.send = io.Send.init(self.loop, self, sent, self.conn);
 
             self.recv.submit(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
 
-        fn received(self: *Self, no_bytes: usize) void {
-            if (no_bytes == 0) return;
+        fn received(self: *Self, no_bytes_: Error!usize) void {
+            const no_bytes = no_bytes_ catch {
+                self.recv_done = true;
+                return;
+            };
             self.tail += no_bytes;
             self.recv.submit(self.buffer[self.tail .. self.tail + recv_chunk]);
             self.trySend();
@@ -452,35 +461,42 @@ test "echo server" {
 
         fn trySend(self: *Self) void {
             if (self.send.active()) return;
-            if (self.head >= self.tail) return;
+            if (self.head == self.tail) {
+                if (self.recv_done) {
+                    self.send.shutdown() catch {};
+                }
+                return;
+            }
             self.send.submit(self.buffer[self.head..self.tail]);
         }
 
-        fn sent(self: *Self, no_bytes: usize) void {
-            if (no_bytes == 0) return;
+        fn sent(self: *Self, no_bytes_: Error!usize) void {
+            const no_bytes = no_bytes_ catch return;
             self.head += no_bytes;
             self.trySend();
         }
 
-        fn failure(_: *Self, _: anyerror, _: os.E) void {
-            unreachable;
-        }
-
         fn start(self: *Self, address: net.Address) !void {
             self.socket = try listen(address);
-            self.accept = io.Accept.init(self.loop, self, accepted, failure, self.socket);
+            self.accept = io.Accept.init(self.loop, self, accepted, self.socket);
             self.accept.submit();
+        }
+
+        fn stop(self: *Self) void {
+            os.closeSocket(self.conn);
+            os.closeSocket(self.socket);
         }
     };
     const buffer = [_]u8{ '0', '1', '2', '3', '4', '5', '6', '7' } ** (1024 / 8);
     var server = Server{ .loop = &loop };
     const address = try net.Address.parseIp4("127.0.0.1", 3132);
     try server.start(address);
+    defer server.stop();
 
     const thr = try std.Thread.spawn(.{}, testClient, .{ address, &buffer });
     try loop.run(.until_done);
-    std.debug.print("LOOP DONE\n", .{});
-    try server.recv.shutdown();
+    //std.debug.print("LOOP DONE\n", .{});
+    //try server.send.shutdown();
     thr.join();
     try testing.expectEqual(buffer.len, server.tail);
 }
@@ -494,12 +510,11 @@ fn testClient(address: net.Address, buffer: []const u8) !void {
         tail: usize = 0,
 
         fn loop(self: *@This()) !void {
-            std.debug.print("reader looop\n", .{});
+            //std.debug.print("reader looop\n", .{});
             while (true) {
                 const n = try self.conn.read(self.read_buffer[self.tail..]);
-                std.debug.print("received {d}\n", .{n});
+                //std.debug.print("received {d}\n", .{n});
                 if (n == 0) break;
-
                 self.tail += n;
             }
         }
@@ -513,10 +528,10 @@ fn testClient(address: net.Address, buffer: []const u8) !void {
         var m = if (n + 10 > buffer.len) buffer.len else n + 10;
         //std.debug.print("sending {d} {d}\n", .{ n, m });
         n += try conn.write(buffer[n..m]);
-        if (n < 512) {
-            conn.close();
-            break;
-        }
+        // if (n < 512) {
+        //     conn.close();
+        //     return;
+        // }
     }
 
     try os.shutdown(conn.handle, .send);
