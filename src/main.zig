@@ -18,15 +18,9 @@ const FIFO = @import("fifo.zig").FIFO;
 const log = std.log;
 const print = std.debug.print;
 
-// TODO:
-// naming Completion => Operation
-//
-// treba li mi u failure oba param i error i os.E kada jedan mogu izvuci iz drugog
-//   neka bude samo os.E, pa neki si klijent misli kako ce to tumaciti, ostavi errno.Error da moze napraviti error
-// nisam bas sretan kako u submit mogu promjeniti args, to mi se cini malo traljavo
-//
 // prouci kada moze dobiti INTR: // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
 //  kaze u enter io_uring
+//  rename ready() to submitReady()
 
 const Completion = struct {
     /// This union encodes the set of operations supported as well as their arguments.
@@ -178,6 +172,108 @@ const Accept = struct {
                 .context = context,
                 .complete = wrapper.complete,
             },
+        };
+    }
+};
+
+const Stream = struct {
+    loop: *Loop,
+    completion: Completion,
+    socket: os.socket_t,
+
+    pub fn connect(
+        self: *Stream,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), socket: Error!os.socket_t) void,
+        address: net.Address,
+    ) !void {
+        assert(self.completion.ready());
+
+        const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+        errdefer os.closeSocket(socket);
+        self.socket = socket;
+
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                _ = res;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
+                if (err) |e| {
+                    completion.setError(e);
+                    callback(ctx, e);
+                } else {
+                    callback(ctx, completion.args.connect.socket);
+                }
+            }
+        };
+
+        self.completion = .{
+            .args = .{ .connect = .{ .socket = self.socket, .address = address } },
+            .context = context,
+            .complete = wrapper.complete,
+        };
+
+        self.loop.submit(&self.completion);
+    }
+
+    pub fn reader(
+        self: *Stream,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
+    ) Recv {
+        return Recv.init(self.loop, context, callback, self.socket);
+    }
+
+    pub fn writer(
+        self: *Stream,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
+    ) Send {
+        return Send.init(self.loop, context, callback, self.socket);
+    }
+
+    pub fn close(
+        self: *Stream,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), result: Error!void) void,
+    ) void {
+        assert(self.completion.ready());
+
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                _ = res;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
+                if (err) |e| {
+                    completion.setError(e);
+                    callback(ctx, e);
+                } else {
+                    callback(ctx, {});
+                }
+            }
+        };
+
+        self.completion = .{
+            .args = .{ .close = .{ .fd = self.socket } },
+            .context = context,
+            .complete = wrapper.complete,
+        };
+        self.loop.submit(&self.completion);
+    }
+
+    pub fn ready(self: *Stream) bool {
+        return self.completion.ready();
+    }
+
+    pub fn init(loop: *Loop) Stream {
+        return .{
+            .socket = undefined,
+            .loop = loop,
+            .completion = undefined,
         };
     }
 };
@@ -574,6 +670,7 @@ test "echo server" {
         loop: *io.Loop,
         socket: os.socket_t = undefined, // client connection socket
         // operations
+        stream: io.Stream = undefined,
         recv: io.Recv = undefined,
         send: io.Send = undefined,
 
@@ -583,12 +680,25 @@ test "echo server" {
         send_buffer: []const u8 = undefined,
         send_pos: usize = 0,
 
-        fn start(self: *Self) void {
-            self.recv = io.Recv.init(self.loop, self, received, self.socket);
-            self.send = io.Send.init(self.loop, self, sent, self.socket);
+        fn connect(self: *Self, address: net.Address) !void {
+            self.stream = io.Stream.init(self.loop);
+            try self.stream.connect(self, connected, address);
+        }
+
+        fn connected(self: *Self, socket_: io.Error!os.socket_t) void {
+            self.socket = socket_ catch unreachable;
+            self.recv = self.stream.reader(self, received);
+            self.send = self.stream.writer(self, sent);
             self.send.submit(self.send_buffer[self.send_pos .. self.send_pos + send_chunk]);
             self.recv.submit(self.recv_buffer[self.recv_pos..]);
         }
+
+        // fn start(self: *Self) void {
+        //     self.recv = io.Recv.init(self.loop, self, received, self.socket);
+        //     self.send = io.Send.init(self.loop, self, sent, self.socket);
+        //     self.send.submit(self.send_buffer[self.send_pos .. self.send_pos + send_chunk]);
+        //     self.recv.submit(self.recv_buffer[self.recv_pos..]);
+        // }
 
         fn received(self: *Self, no_bytes_: Error!usize) void {
             const no_bytes = no_bytes_ catch {
@@ -621,8 +731,13 @@ test "echo server" {
 
         fn close(self: *Self) void {
             if (self.send.closed() and self.recv.closed()) {
-                os.closeSocket(self.socket);
+                //os.closeSocket(self.socket);
+                self.stream.close(self, closed);
             }
+        }
+
+        fn closed(self: *Self, _: io.Error!void) void {
+            _ = self;
         }
     };
 
@@ -638,9 +753,11 @@ test "echo server" {
 
     var client_loop = try io.Loop.init(.{});
     defer client_loop.deinit();
-    var client_conn = try std.net.tcpConnectToAddress(address);
-    var client = Client{ .loop = &client_loop, .send_buffer = &buffer, .socket = client_conn.handle };
-    client.start();
+    //var client_conn = try std.net.tcpConnectToAddress(address);
+    //var client = Client{ .loop = &client_loop, .send_buffer = &buffer, .socket = client_conn.handle };
+    //client.start();
+    var client = Client{ .loop = &client_loop, .send_buffer = &buffer };
+    try client.connect(address);
     const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, Loop.RunMode.until_done });
 
     try loop.run(.until_done);
