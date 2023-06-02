@@ -64,6 +64,10 @@ const Completion = struct {
             buffer: []const u8,
             offset: u64,
         },
+        shutdown: struct {
+            socket: os.socket_t,
+            how: os.ShutdownHow,
+        },
     };
 
     const State = enum {
@@ -118,6 +122,9 @@ const Completion = struct {
             },
             .write => |args| {
                 linux.io_uring_prep_write(sqe, args.fd, args.buffer, args.offset);
+            },
+            .shutdown => |args| {
+                linux.io_uring_prep_shutdown(sqe, args.socket, @enumToInt(args.how));
             },
         }
         sqe.user_data = @ptrToInt(self);
@@ -179,6 +186,7 @@ const Send = struct {
     loop: *Loop,
     completion: Completion,
 
+    // sumbits completion to the loop
     pub fn submit(self: *Send, buffer: []const u8) void {
         assert(buffer.len > 0);
         self.completion.args.send.buffer = buffer;
@@ -193,9 +201,13 @@ const Send = struct {
         return self.completion.closed();
     }
 
-    pub fn shutdown(self: *Send) !void {
-        self.completion.state = .closed; // TODO: go through loop
-        try os.shutdown(self.completion.args.send.socket, .send);
+    // changes completion from send to shutdown and submits completion
+    // can't use completion after this
+    pub fn shutdown(self: *Send) void {
+        assert(self.completion.args == .send);
+        const socket = self.completion.args.send.socket;
+        self.completion.args = .{ .shutdown = .{ .socket = socket, .how = .send } };
+        self.loop.submit(&self.completion);
     }
 
     pub fn init(
@@ -206,6 +218,8 @@ const Send = struct {
     ) Send {
         const Context = @TypeOf(context);
         const wrapper = struct {
+            // valid for both send and shutdown callbacks
+            // shudown returns res = 0 on success
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
@@ -387,15 +401,22 @@ pub const Loop = struct {
     }
 };
 
-pub fn listen(address: net.Address) !os.socket_t {
+pub fn listen(address: *net.Address) !os.socket_t {
     const kernel_backlog = 1;
-    const listener_socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-    errdefer os.closeSocket(listener_socket);
+    const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+    errdefer os.closeSocket(socket);
 
-    try os.setsockopt(listener_socket, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
-    try os.bind(listener_socket, &address.any, address.getOsSockLen());
-    try os.listen(listener_socket, kernel_backlog);
-    return listener_socket;
+    try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
+    try os.bind(socket, &address.any, address.getOsSockLen());
+    try os.listen(socket, kernel_backlog);
+
+    if (address.getPort() == 0) {
+        // If we were called with port 0
+        // set address to the OS-chosen IP/port from socket.
+        var slen: os.socklen_t = address.getOsSockLen();
+        try os.getsockname(socket, &address.any, &slen);
+    }
+    return socket;
 }
 
 test "Completion accept success/failure callbacks" {
@@ -429,8 +450,8 @@ test "Completion accept success/failure callbacks" {
 }
 
 test "accept" {
-    const address = try net.Address.parseIp4("127.0.0.1", 3131);
-    const listener_socket = try listen(address);
+    var address = try net.Address.parseIp4("127.0.0.1", 0);
+    const listener_socket = try listen(&address);
     var loop = try Loop.init(.{});
     defer loop.deinit();
 
@@ -487,6 +508,7 @@ test "echo server" {
 
         fn received(self: *Self, no_bytes_: Error!usize) void {
             const no_bytes = no_bytes_ catch {
+                self.trySend();
                 self.close();
                 return;
             };
@@ -500,7 +522,7 @@ test "echo server" {
             if (!self.send.ready()) return;
             if (self.head == self.tail) {
                 if (self.recv.closed())
-                    self.send.shutdown() catch {};
+                    self.send.shutdown();
                 return;
             }
             self.send.submit(self.buffer[self.head..self.tail]);
@@ -536,7 +558,7 @@ test "echo server" {
             self.conn.start();
         }
 
-        fn listen(self: *Self, address: net.Address) !void {
+        fn listen(self: *Self, address: *net.Address) !void {
             self.socket = try io.listen(address);
             self.accept = io.Accept.init(self.loop, self, accepted, self.socket);
             self.accept.submit();
@@ -588,7 +610,7 @@ test "echo server" {
             //print("client sent {d} {d}\n", .{ self.send_pos, no_bytes });
 
             if (self.send_pos >= self.send_buffer.len) {
-                self.send.shutdown() catch {};
+                self.send.shutdown();
                 return;
             }
 
@@ -609,9 +631,9 @@ test "echo server" {
     var loop = try io.Loop.init(.{});
     defer loop.deinit();
 
-    const address = try net.Address.parseIp4("127.0.0.1", 3132);
+    var address = try net.Address.parseIp4("127.0.0.1", 0);
     var server = Server{ .loop = &loop };
-    try server.listen(address);
+    try server.listen(&address);
     defer server.close();
 
     var client_loop = try io.Loop.init(.{});
