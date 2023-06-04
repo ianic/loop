@@ -22,9 +22,17 @@ const print = std.debug.print;
 //  kaze u enter io_uring
 //  rename ready() to submitReady()
 
+test "size of Completion" {
+    print("Completion size: {d}\n", .{@sizeOf(Completion)});
+    print("Args size: {d}\n", .{@sizeOf(Completion.Args)});
+    print("net.Address size: {d}\n", .{@sizeOf(net.Address)});
+    print("os.socket_t size: {d}\n", .{@sizeOf(os.socket_t)});
+}
+
 const Completion = struct {
     /// This union encodes the set of operations supported as well as their arguments.
     const Args = union(enum) {
+        none: void,
         accept: struct {
             socket: os.socket_t,
             address: os.sockaddr = undefined,
@@ -120,6 +128,7 @@ const Completion = struct {
             .shutdown => |args| {
                 linux.io_uring_prep_shutdown(sqe, args.socket, @enumToInt(args.how));
             },
+            .none => undefined,
         }
         sqe.user_data = @ptrToInt(self);
     }
@@ -176,47 +185,64 @@ const Accept = struct {
     }
 };
 
-const Stream = struct {
+const Listener = struct {
     loop: *Loop,
     completion: Completion,
+    address: net.Address,
     socket: os.socket_t,
 
-    pub fn connect(
-        self: *Stream,
+    pub fn accept(self: *Listener) void {
+        self.loop.submit(&self.completion);
+    }
+
+    pub fn ready(self: *Listener) bool {
+        return self.completion.ready();
+    }
+
+    pub fn closed(self: *Listener) bool {
+        return self.completion.closed();
+    }
+
+    pub fn init(
+        loop: *Loop,
         context: anytype,
         comptime callback: fn (context: @TypeOf(context), socket: Error!os.socket_t) void,
-        address: net.Address,
-    ) !void {
-        assert(self.completion.ready());
-
-        const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-        errdefer os.closeSocket(socket);
-        self.socket = socket;
+        address_: net.Address,
+    ) !Listener {
+        var address = address_;
+        const socket = try listen(&address);
 
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                _ = res;
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     completion.setError(e);
                     callback(ctx, e);
                 } else {
-                    callback(ctx, completion.args.connect.socket);
+                    callback(ctx, @intCast(os.socket_t, res));
                 }
             }
         };
-
-        self.completion = .{
-            .args = .{ .connect = .{ .socket = self.socket, .address = address } },
-            .context = context,
-            .complete = wrapper.complete,
+        return .{
+            .loop = loop,
+            .address = address,
+            .socket = socket,
+            .completion = .{
+                .args = .{ .accept = .{ .socket = socket } },
+                .context = context,
+                .complete = wrapper.complete,
+            },
         };
-
-        self.loop.submit(&self.completion);
     }
+};
+
+const Stream = struct {
+    loop: *Loop,
+    completion: Completion,
+    socket: os.socket_t,
 
     pub fn reader(
         self: *Stream,
@@ -269,11 +295,46 @@ const Stream = struct {
         return self.completion.ready();
     }
 
-    pub fn init(loop: *Loop) Stream {
+    pub fn connect(self: *Stream) void {
+        assert(self.completion.state == .initial);
+        assert(self.completion.args == .connect);
+
+        self.loop.submit(&self.completion);
+    }
+
+    pub fn init(
+        loop: *Loop,
+        context: anytype,
+        comptime callback: fn (context: @TypeOf(context), result: Error!void) void,
+        address: net.Address,
+    ) !Stream {
+        const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+        errdefer os.closeSocket(socket);
+
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                _ = res;
+                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
+                if (err) |e| {
+                    completion.setError(e);
+                    callback(ctx, e);
+                } else {
+                    callback(ctx, {});
+                }
+            }
+        };
+
         return .{
-            .socket = undefined,
+            .socket = socket,
             .loop = loop,
-            .completion = undefined,
+            .completion = .{
+                .args = .{ .connect = .{ .socket = socket, .address = address } },
+                .context = context,
+                .complete = wrapper.complete,
+            },
         };
     }
 };
@@ -287,6 +348,10 @@ const Send = struct {
         assert(buffer.len > 0);
         self.completion.args.send.buffer = buffer;
         self.loop.submit(&self.completion);
+    }
+
+    pub fn write(self: *Send, buffer: []const u8) void {
+        self.submit(buffer);
     }
 
     pub fn ready(self: *Send) bool {
@@ -304,6 +369,10 @@ const Send = struct {
         const socket = self.completion.args.send.socket;
         self.completion.args = .{ .shutdown = .{ .socket = socket, .how = .send } };
         self.loop.submit(&self.completion);
+    }
+
+    pub fn close(self: *Send) void {
+        self.shutdown();
     }
 
     pub fn init(
@@ -347,6 +416,10 @@ const Recv = struct {
         assert(buffer.len > 0);
         self.completion.args.recv.buffer = buffer;
         self.loop.submit(&self.completion);
+    }
+
+    pub fn read(self: *Recv, buffer: []u8) void {
+        self.submit(buffer);
     }
 
     pub fn ready(self: *Recv) bool {
@@ -644,99 +717,98 @@ test "echo server" {
     const Server = struct {
         const Self = @This();
         loop: *io.Loop,
-        socket: os.socket_t = undefined, // accept socket
-        accept: io.Accept = undefined,
+        //socket: os.socket_t = undefined, // accept socket
+        listener: io.Listener = undefined,
         conn: Connection = undefined,
 
-        fn accepted(self: *Self, socket_: Error!os.socket_t) void {
+        fn listen(self: *Self, address: net.Address) !void {
+            self.listener = try io.Listener.init(self.loop, self, acceptCompleted, address);
+            self.listener.accept(); // TODO ovdje moze ici how: single multishot
+        }
+
+        fn acceptCompleted(self: *Self, socket_: Error!os.socket_t) void {
+            // TODO proslijedi ovdje io.Connection koji ima metode reader i writer u sebi ima socket i loop
+            // i metodu close
+            // i onda i u connection gore ide naming reader writer
+            // read write shutdown => close
             var conn_socket = socket_ catch unreachable;
             self.conn = .{ .loop = self.loop, .socket = conn_socket };
             self.conn.start();
         }
 
-        fn listen(self: *Self, address: *net.Address) !void {
-            self.socket = try io.listen(address);
-            self.accept = io.Accept.init(self.loop, self, accepted, self.socket);
-            self.accept.submit();
-        }
-
         fn close(self: *Self) void {
-            os.closeSocket(self.socket);
+            // TODO
+            os.closeSocket(self.listener.socket);
         }
     };
 
     const Client = struct {
         const Self = @This();
         loop: *io.Loop,
-        socket: os.socket_t = undefined, // client connection socket
+
         // operations
         stream: io.Stream = undefined,
-        recv: io.Recv = undefined,
-        send: io.Send = undefined,
+        reader: io.Recv = undefined,
+        writer: io.Send = undefined,
 
-        recv_buffer: [buffer_len * 3]u8 = undefined,
-        recv_pos: usize = 0,
+        reader_buffer: [buffer_len * 3]u8 = undefined,
+        reader_pos: usize = 0,
 
-        send_buffer: []const u8 = undefined,
-        send_pos: usize = 0,
+        writer_buffer: []const u8 = undefined,
+        writer_pos: usize = 0,
 
         fn connect(self: *Self, address: net.Address) !void {
-            self.stream = io.Stream.init(self.loop);
-            try self.stream.connect(self, connected, address);
+            self.stream = try io.Stream.init(self.loop, self, connectCompleted, address);
+            self.stream.connect();
         }
 
-        fn connected(self: *Self, socket_: io.Error!os.socket_t) void {
-            self.socket = socket_ catch unreachable;
-            self.recv = self.stream.reader(self, received);
-            self.send = self.stream.writer(self, sent);
-            self.send.submit(self.send_buffer[self.send_pos .. self.send_pos + send_chunk]);
-            self.recv.submit(self.recv_buffer[self.recv_pos..]);
+        fn connectCompleted(self: *Self, result_: io.Error!void) void {
+            _ = result_ catch unreachable;
+
+            self.reader = self.stream.reader(self, readCompleted);
+            self.writer = self.stream.writer(self, writeCompleted);
+
+            self.writer.write(self.writer_buffer[self.writer_pos .. self.writer_pos + send_chunk]);
+            self.reader.read(self.reader_buffer[self.reader_pos..]);
         }
 
-        // fn start(self: *Self) void {
-        //     self.recv = io.Recv.init(self.loop, self, received, self.socket);
-        //     self.send = io.Send.init(self.loop, self, sent, self.socket);
-        //     self.send.submit(self.send_buffer[self.send_pos .. self.send_pos + send_chunk]);
-        //     self.recv.submit(self.recv_buffer[self.recv_pos..]);
-        // }
-
-        fn received(self: *Self, no_bytes_: Error!usize) void {
+        fn readCompleted(self: *Self, no_bytes_: Error!usize) void {
             const no_bytes = no_bytes_ catch {
                 self.close();
                 //print("client received error {}\n", .{err});
                 return;
             };
-            self.recv_pos += no_bytes;
-            //print("client received {d} {d}\n", .{ self.recv_pos, no_bytes });
-            self.recv.submit(self.recv_buffer[self.recv_pos..]);
+            self.reader_pos += no_bytes;
+            //print("client received {d} {d}\n", .{ self.reader_pos, no_bytes });
+            self.reader.read(self.reader_buffer[self.reader_pos..]);
         }
 
-        fn sent(self: *Self, no_bytes_: Error!usize) void {
+        fn writeCompleted(self: *Self, no_bytes_: Error!usize) void {
             const no_bytes = no_bytes_ catch {
                 self.close();
                 return;
             };
-            self.send_pos += no_bytes;
-            //print("client sent {d} {d}\n", .{ self.send_pos, no_bytes });
+            self.writer_pos += no_bytes;
+            //print("client sent {d} {d}\n", .{ self.writer_pos, no_bytes });
 
-            if (self.send_pos >= self.send_buffer.len) {
-                self.send.shutdown();
+            if (self.writer_pos >= self.writer_buffer.len) {
+                self.writer.close();
                 return;
             }
 
-            var to = self.send_pos + send_chunk;
-            if (to > self.send_buffer.len) to = self.send_buffer.len;
-            self.send.submit(self.send_buffer[self.send_pos..to]);
+            var to = self.writer_pos + send_chunk;
+            if (to > self.writer_buffer.len) to = self.writer_buffer.len;
+            self.writer.write(self.writer_buffer[self.writer_pos..to]);
         }
 
         fn close(self: *Self) void {
-            if (self.send.closed() and self.recv.closed()) {
+            if (self.writer.closed() and self.reader.closed()) {
                 //os.closeSocket(self.socket);
-                self.stream.close(self, closed);
+                self.stream.close(self, closeCompleted);
             }
         }
 
-        fn closed(self: *Self, _: io.Error!void) void {
+        fn closeCompleted(self: *Self, _: io.Error!void) void {
             _ = self;
         }
     };
@@ -748,15 +820,13 @@ test "echo server" {
 
     var address = try net.Address.parseIp4("127.0.0.1", 0);
     var server = Server{ .loop = &loop };
-    try server.listen(&address);
+    try server.listen(address);
     defer server.close();
+    address = server.listener.address; // because we have OS chosen port
 
     var client_loop = try io.Loop.init(.{});
     defer client_loop.deinit();
-    //var client_conn = try std.net.tcpConnectToAddress(address);
-    //var client = Client{ .loop = &client_loop, .send_buffer = &buffer, .socket = client_conn.handle };
-    //client.start();
-    var client = Client{ .loop = &client_loop, .send_buffer = &buffer };
+    var client = Client{ .loop = &client_loop, .writer_buffer = &buffer };
     try client.connect(address);
     const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, Loop.RunMode.until_done });
 
@@ -766,11 +836,11 @@ test "echo server" {
     try testing.expect(server.conn.recv.closed());
     try testing.expect(server.conn.send.closed());
 
-    try testing.expect(client.recv.closed());
-    try testing.expect(client.send.closed());
+    try testing.expect(client.reader.closed());
+    try testing.expect(client.writer.closed());
 
     try testing.expectEqual(buffer.len, server.conn.tail);
     try testing.expectEqual(buffer.len, server.conn.head);
-    try testing.expectEqual(buffer.len, client.recv_pos);
-    try testing.expectEqualSlices(u8, &buffer, client.recv_buffer[0..client.recv_pos]);
+    try testing.expectEqual(buffer.len, client.reader_pos);
+    try testing.expectEqualSlices(u8, &buffer, client.reader_buffer[0..client.reader_pos]);
 }
