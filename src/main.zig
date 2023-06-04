@@ -27,6 +27,8 @@ test "size of Completion" {
     print("Args size: {d}\n", .{@sizeOf(Completion.Args)});
     print("net.Address size: {d}\n", .{@sizeOf(net.Address)});
     print("os.socket_t size: {d}\n", .{@sizeOf(os.socket_t)});
+    print("os.socklen_t size: {d}\n", .{@sizeOf(os.socklen_t)});
+    print("os.sockaddr size: {d}\n", .{@sizeOf(os.sockaddr)});
 }
 
 const Completion = struct {
@@ -43,7 +45,8 @@ const Completion = struct {
         },
         connect: struct {
             socket: os.socket_t,
-            address: net.Address,
+            address: os.sockaddr,
+            address_size: os.socklen_t,
         },
         read: struct {
             fd: os.fd_t,
@@ -108,7 +111,7 @@ const Completion = struct {
                 linux.io_uring_prep_close(sqe, args.fd);
             },
             .connect => |*args| {
-                linux.io_uring_prep_connect(sqe, args.socket, &args.address.any, args.address.getOsSockLen());
+                linux.io_uring_prep_connect(sqe, args.socket, &args.address, args.address_size);
             },
             .read => |args| {
                 linux.io_uring_prep_read(sqe, args.fd, args.buffer, args.offset);
@@ -331,7 +334,11 @@ const Stream = struct {
             .socket = socket,
             .loop = loop,
             .completion = .{
-                .args = .{ .connect = .{ .socket = socket, .address = address } },
+                .args = .{ .connect = .{
+                    .socket = socket,
+                    .address = address.any,
+                    .address_size = address.getOsSockLen(),
+                } },
                 .context = context,
                 .complete = wrapper.complete,
             },
