@@ -32,6 +32,10 @@ pub const Listener = struct {
         self.loop.submit(&self.completion);
     }
 
+    pub fn stream(self: *Listener, socket: os.socket_t) Stream {
+        return Stream.init(self.loop, socket);
+    }
+
     pub fn close(
         self: *Listener,
         context: anytype,

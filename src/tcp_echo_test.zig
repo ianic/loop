@@ -20,7 +20,6 @@ test "echo server" {
     // Loops until reader is closed than finishes all writes and closes write part.
     const Connection = struct {
         const Self = @This();
-        loop: *io.Loop,
 
         stream: tcp.Stream = undefined,
         reader: tcp.Recv = undefined,
@@ -98,9 +97,8 @@ test "echo server" {
         }
 
         fn acceptCompleted(self: *Self, socket_: io.Error!os.socket_t) void {
-            var conn_socket = socket_ catch unreachable;
-            self.conn = .{ .loop = self.loop, .stream = tcp.Stream.init(self.loop, conn_socket) };
-
+            var socket = socket_ catch unreachable;
+            self.conn = .{ .stream = self.listener.stream(socket) };
             self.conn.start();
             self.close();
         }
