@@ -26,6 +26,9 @@ test "echo server" {
         reader: tcp.Recv = undefined,
         writer: tcp.Send = undefined,
 
+        writer_err: ?anyerror = null,
+        reader_err: ?anyerror = null,
+
         buffer: [buffer_len * 2]u8 = undefined,
         head: usize = 0,
         tail: usize = 0,
@@ -39,9 +42,9 @@ test "echo server" {
         }
 
         fn readCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch {
+            const no_bytes = no_bytes_ catch |err| {
+                self.reader_err = err;
                 self.tryWrite();
-                self.close();
                 return;
             };
             self.tail += no_bytes;
@@ -52,7 +55,7 @@ test "echo server" {
         fn tryWrite(self: *Self) void {
             if (!self.writer.ready()) return;
             if (self.head == self.tail) {
-                if (self.reader.closed())
+                if (self.reader_err != null)
                     self.writer.close();
                 return;
             }
@@ -60,7 +63,8 @@ test "echo server" {
         }
 
         fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch {
+            const no_bytes = no_bytes_ catch |err| {
+                self.writer_err = err;
                 self.close();
                 return;
             };
@@ -69,9 +73,8 @@ test "echo server" {
         }
 
         fn close(self: *Self) void {
-            if (self.writer.closed() and self.reader.closed()) {
+            if (self.reader_err != null and self.writer_err != null)
                 self.stream.close(self, closeCompleted);
-            }
         }
 
         fn closeCompleted(self: *Self, _: io.Error!void) void {
@@ -129,6 +132,9 @@ test "echo server" {
         writer_buffer: []const u8 = undefined,
         writer_pos: usize = 0,
 
+        writer_err: ?anyerror = null,
+        reader_err: ?anyerror = null,
+
         closed: bool = false,
 
         fn connect(self: *Self, address: net.Address) !void {
@@ -147,7 +153,8 @@ test "echo server" {
         }
 
         fn readCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch {
+            const no_bytes = no_bytes_ catch |err| {
+                self.reader_err = err;
                 self.close();
                 return;
             };
@@ -156,7 +163,8 @@ test "echo server" {
         }
 
         fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch {
+            const no_bytes = no_bytes_ catch |err| {
+                self.writer_err = err;
                 self.close();
                 return;
             };
@@ -173,9 +181,8 @@ test "echo server" {
         }
 
         fn close(self: *Self) void {
-            if (self.writer.closed() and self.reader.closed()) {
+            if (self.writer_err != null and self.reader_err != null)
                 self.cli.close(self, closeCompleted);
-            }
         }
 
         fn closeCompleted(self: *Self, _: io.Error!void) void {
@@ -205,11 +212,11 @@ test "echo server" {
     thr.join();
 
     var conn = server.conn;
-    try testing.expect(conn.reader.closed());
-    try testing.expect(conn.writer.closed());
+    try testing.expect(conn.reader_err != null);
+    try testing.expect(conn.writer_err != null);
 
-    try testing.expect(client.reader.closed());
-    try testing.expect(client.writer.closed());
+    try testing.expect(client.reader_err != null);
+    try testing.expect(client.writer_err != null);
 
     // expect buffer echoed back to the client
     try testing.expectEqual(buffer.len, conn.tail);

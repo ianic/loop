@@ -39,7 +39,7 @@ pub const Loop = struct {
     /// it into submissions fifo.
     pub fn submit(self: *Loop, completion: *Completion) void {
         assert(completion.ready());
-        completion.state = .active;
+        completion.sumitted();
         self.active += 1;
         // try to get place in ring submission queue
         const sqe = self.ring.get_sqe() catch |err| {
@@ -92,7 +92,7 @@ pub const Loop = struct {
 
     fn flush_completions(self: *Loop, wait_nr: u32) !u32 {
         var cqes: [256]io_uring_cqe = undefined;
-        var completed: u32 = 0;
+        var no_completed: u32 = 0;
         while (true) {
             // read completed from completion queue
             const len = self.ring.copy_cqes(&cqes, wait_nr) catch |err| switch (err) {
@@ -101,14 +101,13 @@ pub const Loop = struct {
             };
             self.in_kernel -= len;
             self.active -= len;
-            completed += len;
+            no_completed += len;
             for (cqes[0..len]) |cqe| {
                 // call completion callback
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
-                completion.state = .completed;
-                completion.complete(completion, cqe.err(), cqe.res, cqe.flags);
+                completion.completed(cqe.err(), cqe.res, cqe.flags);
             }
-            if (len < cqes.len) return completed;
+            if (len < cqes.len) return no_completed;
         }
     }
 };

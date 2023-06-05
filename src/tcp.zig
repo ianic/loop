@@ -170,10 +170,6 @@ pub const Send = struct {
         return self.completion.ready();
     }
 
-    pub fn closed(self: *Send) bool {
-        return self.completion.closed();
-    }
-
     // changes completion from send to shutdown and submits completion
     // can't use completion after this
     pub fn shutdown(self: *Send) void {
@@ -212,10 +208,6 @@ pub const Recv = struct {
 
     pub fn ready(self: *Recv) bool {
         return self.completion.ready();
-    }
-
-    pub fn closed(self: *Recv) bool {
-        return self.completion.closed();
     }
 };
 

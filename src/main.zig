@@ -12,7 +12,6 @@ pub const tcp = @import("tcp.zig");
 
 // prouci kada moze dobiti INTR: // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
 //  kaze u enter io_uring
-//  rename ready() to submitReady()
 
 const io = @This();
 
@@ -45,4 +44,8 @@ test "listener accepts connection" {
 fn testConnect(address: net.Address) !void {
     var conn = try std.net.tcpConnectToAddress(address);
     conn.close();
+}
+
+test "import test files" {
+    _ = @import("tcp_echo_test.zig");
 }

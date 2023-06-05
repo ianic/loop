@@ -58,29 +58,19 @@ pub const Completion = struct {
 
     const State = enum {
         initial,
-        active,
-        completed,
-        closed,
+        active, // submitted to the loop
+        completed, // returned from cqe completed/failed
     };
 
     next: ?*Completion = null, // used in fifo
     args: Args,
-    state: State = .initial, // TODO: rethink state, i need to know wether it is sumitted or can be
+    state: State = .initial,
     context: ?*anyopaque,
     complete: *const fn (completion: *Completion, ose: os.E, res: i32, flags: u32) void,
-    err: ?anyerror = null, // TODO: remove this
 
+    // Ready to be sumitted to the loop
     pub fn ready(self: *Completion) bool {
-        return self.state == .completed or self.state == .initial;
-    }
-
-    pub fn closed(self: *Completion) bool {
-        return self.state == .closed;
-    }
-
-    pub fn setError(self: *Completion, err: anyerror) void {
-        self.err = err;
-        self.state = .closed;
+        return self.state != .active;
     }
 
     pub fn prep(self: *Completion, sqe: *io_uring_sqe) void {
@@ -116,6 +106,15 @@ pub const Completion = struct {
         sqe.user_data = @ptrToInt(self);
     }
 
+    pub fn completed(self: *Completion, ose: os.E, res: i32, flags: u32) void {
+        self.state = .completed;
+        self.complete(self, ose, res, flags);
+    }
+
+    pub fn sumitted(self: *Completion) void {
+        self.state = .active;
+    }
+
     pub fn close(
         context: anytype,
         comptime callback: fn (context: @TypeOf(context), result: Error!void) void,
@@ -129,7 +128,6 @@ pub const Completion = struct {
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
-                    completion.setError(e);
                     callback(ctx, e);
                 } else {
                     callback(ctx, {});
@@ -155,7 +153,6 @@ pub const Completion = struct {
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
-                    completion.setError(e);
                     callback(ctx, e);
                 } else {
                     callback(ctx, @intCast(os.socket_t, res));
@@ -183,7 +180,6 @@ pub const Completion = struct {
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
-                    completion.setError(e);
                     callback(ctx, e);
                 } else {
                     callback(ctx, completion.args.connect.socket);
@@ -215,7 +211,6 @@ pub const Completion = struct {
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
-                    completion.setError(e);
                     callback(ctx, e);
                 } else {
                     callback(ctx, @intCast(usize, res));
@@ -241,7 +236,6 @@ pub const Completion = struct {
                 var ctx = @intToPtr(Context, @ptrToInt(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
-                    completion.setError(e);
                     callback(ctx, e);
                 } else {
                     callback(ctx, @intCast(usize, res));
