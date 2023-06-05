@@ -14,73 +14,80 @@ test "echo server" {
     const send_chunk = 9;
     const recv_chunk = 7;
 
+    // Server side echo connection.
+    // Reads into buffer and moves head pointer on every read.
+    // Write moves tail buffer pointer.
+    // Loops until reader is closed than finishes all writes and closes write part.
     const Connection = struct {
         const Self = @This();
         loop: *io.Loop,
-        // operations
+
         stream: tcp.Stream = undefined,
-        recv: tcp.Recv = undefined,
-        send: tcp.Send = undefined,
+        reader: tcp.Recv = undefined,
+        writer: tcp.Send = undefined,
 
         buffer: [buffer_len * 2]u8 = undefined,
         head: usize = 0,
         tail: usize = 0,
 
+        closed: bool = false,
+
         fn start(self: *Self) void {
-            self.recv = self.stream.reader(self, received);
-            self.send = self.stream.writer(self, sent);
-            self.recv.read(self.buffer[self.tail .. self.tail + recv_chunk]);
+            self.reader = self.stream.reader(self, readCompleted);
+            self.writer = self.stream.writer(self, writeCompleted);
+            self.reader.read(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
 
-        fn received(self: *Self, no_bytes_: io.Error!usize) void {
+        fn readCompleted(self: *Self, no_bytes_: io.Error!usize) void {
             const no_bytes = no_bytes_ catch {
-                self.trySend();
+                self.tryWrite();
                 self.close();
                 return;
             };
             self.tail += no_bytes;
-            //print("server received {d} {d}\n", .{ no_bytes, self.tail });
-            self.recv.read(self.buffer[self.tail .. self.tail + recv_chunk]);
-            self.trySend();
+            self.reader.read(self.buffer[self.tail .. self.tail + recv_chunk]);
+            self.tryWrite();
         }
 
-        fn trySend(self: *Self) void {
-            if (!self.send.ready()) return;
+        fn tryWrite(self: *Self) void {
+            if (!self.writer.ready()) return;
             if (self.head == self.tail) {
-                if (self.recv.closed())
-                    self.send.shutdown();
+                if (self.reader.closed())
+                    self.writer.close();
                 return;
             }
-            self.send.write(self.buffer[self.head..self.tail]);
+            self.writer.write(self.buffer[self.head..self.tail]);
         }
 
-        fn sent(self: *Self, no_bytes_: io.Error!usize) void {
+        fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
             const no_bytes = no_bytes_ catch {
                 self.close();
                 return;
             };
             self.head += no_bytes;
-            //print("server sent {d}\n", .{self.head});
-            self.trySend();
+            self.tryWrite();
         }
 
         fn close(self: *Self) void {
-            if (self.send.closed() and self.recv.closed()) {
-                self.stream.close(self, closed);
+            if (self.writer.closed() and self.reader.closed()) {
+                self.stream.close(self, closeCompleted);
             }
         }
 
-        fn closed(self: *Self, _: io.Error!void) void {
-            _ = self;
+        fn closeCompleted(self: *Self, _: io.Error!void) void {
+            self.closed = true;
         }
     };
 
+    // Accepts single connection and closes.
     const Server = struct {
         const Self = @This();
         loop: *io.Loop,
-        //socket: os.socket_t = undefined, // accept socket
+
         listener: tcp.Listener = undefined,
         conn: Connection = undefined,
+
+        closed: bool = false,
 
         fn listen(self: *Self, address: *net.Address) !void {
             self.listener = try tcp.Listener.init(self.loop, self, acceptCompleted, address);
@@ -88,10 +95,6 @@ test "echo server" {
         }
 
         fn acceptCompleted(self: *Self, socket_: io.Error!os.socket_t) void {
-            // TODO proslijedi ovdje io.Connection koji ima metode reader i writer u sebi ima socket i loop
-            // i metodu close
-            // i onda i u connection gore ide naming reader writer
-            // read write shutdown => close
             var conn_socket = socket_ catch unreachable;
             self.conn = .{ .loop = self.loop, .stream = tcp.Stream.init(self.loop, conn_socket) };
 
@@ -100,14 +103,18 @@ test "echo server" {
         }
 
         fn close(self: *Self) void {
-            self.listener.close(self, closed);
+            self.listener.close(self, closeCompleted);
         }
 
-        fn closed(self: *Self, _: io.Error!void) void {
-            _ = self;
+        fn closeCompleted(self: *Self, _: io.Error!void) void {
+            self.closed = true;
         }
     };
 
+    // Connects to server.
+    // Writes writer_buffer in send_chunks.
+    // Reads everything send from the server into reader_buffer.
+    // When finished sending closes write part, and waits for read part to be closed.
     const Client = struct {
         const Self = @This();
         loop: *io.Loop,
@@ -121,6 +128,8 @@ test "echo server" {
 
         writer_buffer: []const u8 = undefined,
         writer_pos: usize = 0,
+
+        closed: bool = false,
 
         fn connect(self: *Self, address: net.Address) !void {
             self.cli = tcp.Client.init(self.loop);
@@ -140,11 +149,9 @@ test "echo server" {
         fn readCompleted(self: *Self, no_bytes_: io.Error!usize) void {
             const no_bytes = no_bytes_ catch {
                 self.close();
-                //print("client received error {}\n", .{err});
                 return;
             };
             self.reader_pos += no_bytes;
-            //print("client received {d} {d}\n", .{ self.reader_pos, no_bytes });
             self.reader.read(self.reader_buffer[self.reader_pos..]);
         }
 
@@ -154,7 +161,6 @@ test "echo server" {
                 return;
             };
             self.writer_pos += no_bytes;
-            //print("client sent {d} {d}\n", .{ self.writer_pos, no_bytes });
 
             if (self.writer_pos >= self.writer_buffer.len) {
                 self.writer.close();
@@ -173,36 +179,47 @@ test "echo server" {
         }
 
         fn closeCompleted(self: *Self, _: io.Error!void) void {
-            _ = self;
+            self.closed = true;
         }
     };
 
-    const buffer = [_]u8{ '0', '1', '2', '3', '4', '5', '6', '7' } ** (buffer_len / 8);
+    const buffer = [_]u8{ '0', '1', '2', '3', '4', '5', '6', '7' } ** (buffer_len / 8); // some random buffer
 
-    var loop = try io.Loop.init(.{});
-    defer loop.deinit();
-
+    // server
+    var server_loop = try io.Loop.init(.{});
+    defer server_loop.deinit();
     var address = try net.Address.parseIp4("127.0.0.1", 0);
-    var server = Server{ .loop = &loop };
+    var server = Server{ .loop = &server_loop };
     try server.listen(&address);
 
+    // client
     var client_loop = try io.Loop.init(.{});
     defer client_loop.deinit();
     var client = Client{ .loop = &client_loop, .writer_buffer = &buffer };
     try client.connect(address);
-    const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, io.Loop.RunMode.until_done });
 
-    try loop.run(.until_done);
+    // start client in another thread
+    const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, io.Loop.RunMode.until_done });
+    // server in this
+    try server_loop.run(.until_done);
     thr.join();
 
-    try testing.expect(server.conn.recv.closed());
-    try testing.expect(server.conn.send.closed());
+    var conn = server.conn;
+    try testing.expect(conn.reader.closed());
+    try testing.expect(conn.writer.closed());
 
     try testing.expect(client.reader.closed());
     try testing.expect(client.writer.closed());
 
-    try testing.expectEqual(buffer.len, server.conn.tail);
-    try testing.expectEqual(buffer.len, server.conn.head);
+    // expect buffer echoed back to the client
+    try testing.expectEqual(buffer.len, conn.tail);
+    try testing.expectEqual(buffer.len, conn.head);
     try testing.expectEqual(buffer.len, client.reader_pos);
-    try testing.expectEqualSlices(u8, &buffer, client.reader_buffer[0..client.reader_pos]);
+    try testing.expectEqualSlices(u8, &buffer, conn.buffer[0..conn.tail]); // conn received all data
+    try testing.expectEqualSlices(u8, &buffer, client.reader_buffer[0..client.reader_pos]); // and return that to client
+
+    // expect all closedCompleted callbacks to be called
+    try testing.expect(client.closed);
+    try testing.expect(conn.closed);
+    try testing.expect(server.closed);
 }
