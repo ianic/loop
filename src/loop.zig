@@ -104,7 +104,7 @@ pub const Loop = struct {
             no_completed += len;
             for (cqes[0..len]) |cqe| {
                 // call completion callback
-                const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
+                const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
                 completion.completed(cqe.err(), cqe.res, cqe.flags);
             }
             if (len < cqes.len) return no_completed;

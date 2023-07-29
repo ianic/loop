@@ -100,10 +100,10 @@ pub const Completion = struct {
                 linux.io_uring_prep_write(sqe, args.fd, args.buffer, args.offset);
             },
             .shutdown => |args| {
-                linux.io_uring_prep_shutdown(sqe, args.socket, @enumToInt(args.how));
+                linux.io_uring_prep_shutdown(sqe, args.socket, @intFromEnum(args.how));
             },
         }
-        sqe.user_data = @ptrToInt(self);
+        sqe.user_data = @intFromPtr(self);
     }
 
     pub fn completed(self: *Completion, ose: os.E, res: i32, flags: u32) void {
@@ -125,7 +125,7 @@ pub const Completion = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
                 _ = res;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -150,12 +150,12 @@ pub const Completion = struct {
         const wrapper = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
                 } else {
-                    callback(ctx, @intCast(os.socket_t, res));
+                    callback(ctx, @as(os.socket_t, @intCast(res)));
                 }
             }
         };
@@ -177,7 +177,7 @@ pub const Completion = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
                 _ = res;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -208,12 +208,12 @@ pub const Completion = struct {
             // shudown returns res = 0 on success
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
                 } else {
-                    callback(ctx, @intCast(usize, res));
+                    callback(ctx, @as(usize, @intCast(res)));
                 }
             }
         };
@@ -233,12 +233,12 @@ pub const Completion = struct {
         const wrapper = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx = @intToPtr(Context, @ptrToInt(completion.context));
+                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
                 } else {
-                    callback(ctx, @intCast(usize, res));
+                    callback(ctx, @as(usize, @intCast(res)));
                 }
             }
         };
