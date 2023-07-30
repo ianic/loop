@@ -65,7 +65,8 @@ pub const Completion = struct {
     next: ?*Completion = null, // used in fifo
     args: Args,
     state: State = .initial,
-    context: ?*anyopaque,
+
+    context: *anyopaque,
     complete: *const fn (completion: *Completion, ose: os.E, res: i32, flags: u32) void,
 
     // Ready to be sumitted to the loop
@@ -125,7 +126,7 @@ pub const Completion = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
                 _ = res;
-                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -150,7 +151,7 @@ pub const Completion = struct {
         const wrapper = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -177,7 +178,7 @@ pub const Completion = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
                 _ = res;
-                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -208,7 +209,7 @@ pub const Completion = struct {
             // shudown returns res = 0 on success
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
@@ -233,7 +234,7 @@ pub const Completion = struct {
         const wrapper = struct {
             fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
                 _ = flags;
-                var ctx: Context = @ptrFromInt(@intFromPtr(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(completion.context));
                 var err: ?Error = if (ose == .SUCCESS) if (res == 0) Error.EOF else null else errno.toError(ose);
                 if (err) |e| {
                     callback(ctx, e);
