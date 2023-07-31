@@ -116,7 +116,6 @@ pub const Client = struct {
 
 pub const Stream = struct {
     loop: *Loop,
-    completion: Completion = undefined,
     socket: os.socket_t,
 
     reader: Recv = undefined,
@@ -129,32 +128,44 @@ pub const Stream = struct {
     pub fn bind(
         self: *Stream,
         context: anytype,
-        comptime readResolve: fn (context: @TypeOf(context), usize) void,
-        comptime writeResolve: fn (context: @TypeOf(context), usize) void,
+        comptime onRead: fn (context: @TypeOf(context), usize) void,
+        comptime onWrite: fn (context: @TypeOf(context), usize) void,
+        comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
+        comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
     ) void {
         self.reader = Recv{ .loop = self.loop };
-        self.reader.bind(self.socket, context, readResolve);
+        self.reader.bind(self.socket, context, onRead);
         self.writer = Send{ .loop = self.loop };
-        self.writer.bind(self.socket, context, writeResolve);
+        self.writer.bind(self.socket, context, onWrite, onShutdown, onClose);
     }
 
-    pub fn close(
-        self: *Stream,
-        context: anytype,
-        comptime callback: fn (context: @TypeOf(context), result: Error!void) void,
-    ) void {
-        assert(self.completion.ready());
-        self.completion = Completion.close(context, callback, self.socket);
-        self.loop.submit(&self.completion);
+    pub fn write(self: *Stream, buffer: []const u8) void {
+        self.writer.write(buffer);
     }
 
-    // pub fn writer(
-    //     self: *Stream,
-    //     context: anytype,
-    //     comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
-    // ) Send {
-    //     return Send.init(self.loop, context, callback, self.socket);
-    // }
+    pub fn read(self: *Stream, buffer: []u8) void {
+        self.reader.read(buffer);
+    }
+
+    pub fn writeReady(self: *Stream) bool {
+        return self.writer.ready();
+    }
+
+    pub fn readReady(self: *Stream) bool {
+        return self.reader.ready();
+    }
+
+    pub fn readClosed(self: *Stream) bool {
+        return self.reader.closed();
+    }
+
+    pub fn shutdown(self: *Stream) void {
+        self.writer.shutdown();
+    }
+
+    pub fn close(self: *Stream) void {
+        self.writer.close();
+    }
 };
 
 pub const Send = struct {
@@ -168,7 +179,9 @@ pub const Send = struct {
         self: *Send,
         socket: os.socket_t,
         context: anytype,
-        comptime resolve: fn (context: @TypeOf(context), usize) void,
+        comptime onWrite: fn (context: @TypeOf(context), usize) void,
+        comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
+        comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
     ) void {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -176,16 +189,30 @@ pub const Send = struct {
                 _ = flags;
                 var send: *Send = @alignCast(@ptrCast(completion.context));
                 var ctx: Context = @alignCast(@ptrCast(send.context));
-                if (ose == .SUCCESS) {
-                    const no_bytes: usize = @intCast(res);
-                    if (no_bytes == 0) {
-                        send.err = error.EOF;
-                    }
-                    resolve(ctx, no_bytes);
-                } else {
-                    send.err = errno.toError(ose);
-                    resolve(ctx, 0);
+                const err: ?anyerror = if (ose == .SUCCESS) null else errno.toError(ose);
+                if (completion.args == .shutdown) {
+                    onShutdown(ctx, err);
+                    return;
                 }
+                if (completion.args == .close) {
+                    onClose(ctx, err);
+                    return;
+                }
+                if (completion.args == .send) {
+                    if (ose == .SUCCESS) {
+                        const no_bytes: usize = @intCast(res);
+                        if (no_bytes == 0) {
+                            // TODO treba li ovo
+                            send.err = error.EOF;
+                        }
+                        onWrite(ctx, no_bytes);
+                    } else {
+                        send.err = errno.toError(ose);
+                        onWrite(ctx, 0);
+                    }
+                    return;
+                }
+                unreachable;
             }
         };
         self.context = context;
@@ -194,10 +221,6 @@ pub const Send = struct {
             .context = self,
             .complete = wrapper.complete,
         };
-    }
-
-    pub fn closed(self: *Send) bool {
-        return self.err != null;
     }
 
     pub fn init(
@@ -219,7 +242,7 @@ pub const Send = struct {
     }
 
     pub fn ready(self: *Send) bool {
-        return self.completion.ready();
+        return self.completion.args == .send and self.completion.ready();
     }
 
     // changes completion from send to shutdown and submits completion
@@ -231,8 +254,12 @@ pub const Send = struct {
         self.loop.submit(&self.completion);
     }
 
+    // changes completion from shutdown to close
     pub fn close(self: *Send) void {
-        self.shutdown();
+        assert(self.completion.args == .shutdown);
+        const socket = self.completion.args.shutdown.socket;
+        self.completion.args = .{ .close = .{ .fd = socket } };
+        self.loop.submit(&self.completion);
     }
 };
 
@@ -257,9 +284,7 @@ pub const Recv = struct {
                 var ctx: Context = @alignCast(@ptrCast(recv.context));
                 if (ose == .SUCCESS) {
                     const no_bytes: usize = @intCast(res);
-                    if (no_bytes == 0) {
-                        recv.err = error.EOF;
-                    }
+                    if (no_bytes == 0) recv.err = error.EOF;
                     resolve(ctx, no_bytes);
                 } else {
                     recv.err = errno.toError(ose);
@@ -279,35 +304,6 @@ pub const Recv = struct {
         return self.err != null;
     }
 
-    pub fn init(
-        loop: *Loop,
-        context: anytype,
-        comptime resolve: fn (context: @TypeOf(context), usize) void,
-        comptime reject: fn (context: @TypeOf(context), anyerror) void,
-        socket: os.socket_t,
-    ) Recv {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
-                _ = flags;
-                var ctx: Context = @alignCast(@ptrCast(completion.context));
-                if (ose == .SUCCESS) {
-                    resolve(ctx, @intCast(res));
-                } else {
-                    reject(ctx, errno.toError(ose));
-                }
-            }
-        };
-        return .{
-            .loop = loop,
-            .completion = .{
-                .args = .{ .recv = .{ .socket = socket, .buffer = undefined } },
-                .context = context,
-                .complete = wrapper.complete,
-            },
-        };
-    }
-
     pub fn read(self: *Recv, buffer: []u8) void {
         assert(buffer.len > 0);
         self.completion.args.recv.buffer = buffer;
@@ -315,10 +311,8 @@ pub const Recv = struct {
     }
 
     pub fn ready(self: *Recv) bool {
-        return self.completion.ready();
+        return self.completion.ready() and self.err == null;
     }
-
-    //pub fn err(self: *Recf) ?anyerror {}
 };
 
 pub fn listen(address: *net.Address) !os.socket_t {

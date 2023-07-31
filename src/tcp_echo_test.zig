@@ -23,9 +23,6 @@ test "echo server" {
 
         stream: tcp.Stream = undefined,
 
-        // writer: tcp.Send = undefined,
-        // writer_err: ?anyerror = null,
-
         buffer: [buffer_len * 2]u8 = undefined,
         head: usize = 0,
         tail: usize = 0,
@@ -33,59 +30,44 @@ test "echo server" {
         closed: bool = false,
 
         fn start(self: *Self) void {
-            self.stream.bind(self, readResolve, writeResolve);
-            // self.reader = self.stream.reader(self, readResolve, readReject);
-            // self.writer = self.stream.writer(self, writeCompleted);
-            self.stream.reader.read(self.buffer[self.tail .. self.tail + recv_chunk]);
+            self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
+            // start reading
+            self.stream.read(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
 
-        fn readResolve(self: *Self, no_bytes: usize) void {
+        // when read completed
+        // start new read until client signals no more data (shutdown of his write stream)
+        fn onRead(self: *Self, no_bytes: usize) void {
             if (no_bytes != 0) {
                 self.tail += no_bytes;
-                // TODO: too much dots
-                self.stream.reader.read(self.buffer[self.tail .. self.tail + recv_chunk]);
+                self.stream.read(self.buffer[self.tail .. self.tail + recv_chunk]);
             }
             self.tryWrite();
         }
 
         fn tryWrite(self: *Self) void {
-            if (!self.stream.writer.ready()) return;
+            if (!self.stream.writeReady()) return;
             if (self.head == self.tail) {
-                if (self.stream.reader.closed()) {
-                    std.debug.print("calling writer close \n", .{});
-                    self.stream.writer.close();
-                }
+                if (self.stream.readClosed())
+                    self.stream.shutdown();
                 return;
             }
-            self.stream.writer.write(self.buffer[self.head..self.tail]);
+            self.stream.write(self.buffer[self.head..self.tail]);
         }
 
-        fn writeResolve(self: *Self, no_bytes: usize) void {
+        fn onWrite(self: *Self, no_bytes: usize) void {
             if (no_bytes == 0) {
-                std.debug.print("writeResolve 0 bytes {?}\n", .{self.stream.writer.err});
-                self.close();
-                return;
+                unreachable;
             }
             self.head += no_bytes;
             self.tryWrite();
         }
 
-        // fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-        //     const no_bytes = no_bytes_ catch |err| {
-        //         self.writer_err = err;
-        //         self.close();
-        //         return;
-        //     };
-        //     self.head += no_bytes;
-        //     self.tryWrite();
-        // }
-
-        fn close(self: *Self) void {
-            if (self.stream.reader.closed() and self.stream.writer.closed())
-                self.stream.close(self, closeCompleted);
+        fn onShutdown(self: *Self, _: ?anyerror) void {
+            self.stream.close();
         }
 
-        fn closeCompleted(self: *Self, _: io.Error!void) void {
+        fn onClose(self: *Self, _: ?anyerror) void {
             self.closed = true;
         }
     };
@@ -128,10 +110,8 @@ test "echo server" {
     const Client = struct {
         const Self = @This();
         loop: *io.Loop,
-
-        cli: tcp.Client = undefined,
-        reader: tcp.Recv = undefined,
-        writer: tcp.Send = undefined,
+        socket: os.socket_t,
+        stream: tcp.Stream = undefined,
 
         reader_buffer: [buffer_len * 3]u8 = undefined,
         reader_pos: usize = 0,
@@ -139,75 +119,47 @@ test "echo server" {
         writer_buffer: []const u8 = undefined,
         writer_pos: usize = 0,
 
-        writer_err: ?anyerror = null,
-        reader_err: ?anyerror = null,
-
         closed: bool = false,
 
-        fn connect(self: *Self, address: net.Address) !void {
-            self.cli = tcp.Client.init(self.loop);
-            try self.cli.connect(self, connectCompleted, address);
+        fn connect(self: *Self) !void {
+            // TODO: gdje je dobro mjesto za ovu inicijalizaciju
+            self.stream = tcp.Stream.init(self.loop, self.socket);
+            self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
+
+            self.stream.write(self.writer_buffer[self.writer_pos .. self.writer_pos + send_chunk]);
+            self.stream.read(self.reader_buffer[self.reader_pos..]);
         }
 
-        fn connectCompleted(self: *Self, result_: io.Error!os.socket_t) void {
-            _ = result_ catch unreachable;
-
-            self.reader = self.cli.reader(self, readResolve, readReject);
-            self.writer = self.cli.writer(self, writeCompleted);
-
-            self.writer.write(self.writer_buffer[self.writer_pos .. self.writer_pos + send_chunk]);
-            self.reader.read(self.reader_buffer[self.reader_pos..]);
-        }
-
-        fn readResolve(self: *Self, no_bytes: usize) void {
+        fn onRead(self: *Self, no_bytes: usize) void {
             if (no_bytes == 0) {
-                // TODO
-                self.reader_err = error.EOF;
-                self.close();
+                self.stream.close();
                 return;
             }
             self.reader_pos += no_bytes;
-            self.reader.read(self.reader_buffer[self.reader_pos..]);
+            self.stream.read(self.reader_buffer[self.reader_pos..]);
         }
 
-        fn readReject(self: *Self, err: anyerror) void {
-            self.reader_err = err;
-        }
-
-        // fn readCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-        //     const no_bytes = no_bytes_ catch |err| {
-        //         self.reader_err = err;
-        //         self.close();
-        //         return;
-        //     };
-        //     self.reader_pos += no_bytes;
-        //     self.reader.read(self.reader_buffer[self.reader_pos..]);
-        // }
-
-        fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch |err| {
-                self.writer_err = err;
-                self.close();
-                return;
-            };
+        fn onWrite(self: *Self, no_bytes: usize) void {
+            if (no_bytes == 0) {
+                unreachable;
+            }
             self.writer_pos += no_bytes;
 
             if (self.writer_pos >= self.writer_buffer.len) {
-                self.writer.close();
+                self.stream.shutdown();
                 return;
             }
 
             var to = self.writer_pos + send_chunk;
             if (to > self.writer_buffer.len) to = self.writer_buffer.len;
-            self.writer.write(self.writer_buffer[self.writer_pos..to]);
+            self.stream.write(self.writer_buffer[self.writer_pos..to]);
         }
 
-        fn close(self: *Self) void {
-            if (self.writer_err != null and self.reader_err != null)
-                self.cli.close(self, closeCompleted);
+        fn onShutdown(self: *Self, _: ?anyerror) void {
+            _ = self;
         }
 
-        fn closeCompleted(self: *Self, _: io.Error!void) void {
+        fn onClose(self: *Self, _: ?anyerror) void {
             self.closed = true;
         }
     };
@@ -224,8 +176,10 @@ test "echo server" {
     // client
     var client_loop = try io.Loop.init(.{});
     defer client_loop.deinit();
-    var client = Client{ .loop = &client_loop, .writer_buffer = &buffer };
-    try client.connect(address);
+
+    var ts = try std.net.tcpConnectToAddress(address);
+    var client = Client{ .loop = &client_loop, .writer_buffer = &buffer, .socket = ts.handle };
+    try client.connect();
 
     // start client in another thread
     const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, io.Loop.RunMode.until_done });
@@ -235,10 +189,11 @@ test "echo server" {
 
     var conn = server.conn;
     try testing.expect(conn.stream.reader.closed());
-    try testing.expect(conn.stream.writer.closed());
+    try testing.expect(conn.stream.reader.err.? == error.EOF);
 
-    try testing.expect(client.reader_err != null);
-    try testing.expect(client.writer_err != null);
+    try testing.expect(client.stream.reader.err != null);
+    try testing.expect(client.stream.reader.err.? == error.EOF);
+    try testing.expect(client.stream.writer.err == null);
 
     // expect buffer echoed back to the client
     try testing.expectEqual(buffer.len, conn.tail);
