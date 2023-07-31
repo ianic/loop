@@ -120,7 +120,7 @@ pub const Stream = struct {
     socket: os.socket_t,
 
     reader: Recv = undefined,
-    // writer: Send = undefined,
+    writer: Send = undefined,
 
     pub fn init(loop: *Loop, socket: os.socket_t) Stream {
         return .{ .loop = loop, .socket = socket };
@@ -130,9 +130,12 @@ pub const Stream = struct {
         self: *Stream,
         context: anytype,
         comptime readResolve: fn (context: @TypeOf(context), usize) void,
+        comptime writeResolve: fn (context: @TypeOf(context), usize) void,
     ) void {
         self.reader = Recv{ .loop = self.loop };
         self.reader.bind(self.socket, context, readResolve);
+        self.writer = Send{ .loop = self.loop };
+        self.writer.bind(self.socket, context, writeResolve);
     }
 
     pub fn close(
@@ -145,18 +148,57 @@ pub const Stream = struct {
         self.loop.submit(&self.completion);
     }
 
-    pub fn writer(
-        self: *Stream,
-        context: anytype,
-        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
-    ) Send {
-        return Send.init(self.loop, context, callback, self.socket);
-    }
+    // pub fn writer(
+    //     self: *Stream,
+    //     context: anytype,
+    //     comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
+    // ) Send {
+    //     return Send.init(self.loop, context, callback, self.socket);
+    // }
 };
 
 pub const Send = struct {
     loop: *Loop,
-    completion: Completion,
+    completion: Completion = undefined,
+
+    context: *anyopaque = undefined,
+    err: ?anyerror = null,
+
+    pub fn bind(
+        self: *Send,
+        socket: os.socket_t,
+        context: anytype,
+        comptime resolve: fn (context: @TypeOf(context), usize) void,
+    ) void {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                var send: *Send = @alignCast(@ptrCast(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(send.context));
+                if (ose == .SUCCESS) {
+                    const no_bytes: usize = @intCast(res);
+                    if (no_bytes == 0) {
+                        send.err = error.EOF;
+                    }
+                    resolve(ctx, no_bytes);
+                } else {
+                    send.err = errno.toError(ose);
+                    resolve(ctx, 0);
+                }
+            }
+        };
+        self.context = context;
+        self.completion = .{
+            .args = .{ .send = .{ .socket = socket, .buffer = undefined } },
+            .context = self,
+            .complete = wrapper.complete,
+        };
+    }
+
+    pub fn closed(self: *Send) bool {
+        return self.err != null;
+    }
 
     pub fn init(
         loop: *Loop,

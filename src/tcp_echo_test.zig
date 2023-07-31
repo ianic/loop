@@ -22,9 +22,9 @@ test "echo server" {
         const Self = @This();
 
         stream: tcp.Stream = undefined,
-        writer: tcp.Send = undefined,
 
-        writer_err: ?anyerror = null,
+        // writer: tcp.Send = undefined,
+        // writer_err: ?anyerror = null,
 
         buffer: [buffer_len * 2]u8 = undefined,
         head: usize = 0,
@@ -33,9 +33,9 @@ test "echo server" {
         closed: bool = false,
 
         fn start(self: *Self) void {
-            self.stream.bind(self, readResolve);
+            self.stream.bind(self, readResolve, writeResolve);
             // self.reader = self.stream.reader(self, readResolve, readReject);
-            self.writer = self.stream.writer(self, writeCompleted);
+            // self.writer = self.stream.writer(self, writeCompleted);
             self.stream.reader.read(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
 
@@ -49,27 +49,39 @@ test "echo server" {
         }
 
         fn tryWrite(self: *Self) void {
-            if (!self.writer.ready()) return;
+            if (!self.stream.writer.ready()) return;
             if (self.head == self.tail) {
-                if (self.stream.reader.closed())
-                    self.writer.close();
+                if (self.stream.reader.closed()) {
+                    std.debug.print("calling writer close \n", .{});
+                    self.stream.writer.close();
+                }
                 return;
             }
-            self.writer.write(self.buffer[self.head..self.tail]);
+            self.stream.writer.write(self.buffer[self.head..self.tail]);
         }
 
-        fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
-            const no_bytes = no_bytes_ catch |err| {
-                self.writer_err = err;
+        fn writeResolve(self: *Self, no_bytes: usize) void {
+            if (no_bytes == 0) {
+                std.debug.print("writeResolve 0 bytes {?}\n", .{self.stream.writer.err});
                 self.close();
                 return;
-            };
+            }
             self.head += no_bytes;
             self.tryWrite();
         }
 
+        // fn writeCompleted(self: *Self, no_bytes_: io.Error!usize) void {
+        //     const no_bytes = no_bytes_ catch |err| {
+        //         self.writer_err = err;
+        //         self.close();
+        //         return;
+        //     };
+        //     self.head += no_bytes;
+        //     self.tryWrite();
+        // }
+
         fn close(self: *Self) void {
-            if (self.stream.reader.closed() and self.writer_err != null)
+            if (self.stream.reader.closed() and self.stream.writer.closed())
                 self.stream.close(self, closeCompleted);
         }
 
@@ -223,8 +235,7 @@ test "echo server" {
 
     var conn = server.conn;
     try testing.expect(conn.stream.reader.closed());
-    // try testing.expect(conn.reader_err != null);
-    try testing.expect(conn.writer_err != null);
+    try testing.expect(conn.stream.writer.closed());
 
     try testing.expect(client.reader_err != null);
     try testing.expect(client.writer_err != null);
