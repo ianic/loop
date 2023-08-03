@@ -29,7 +29,7 @@ test "echo server" {
 
         closed: bool = false,
 
-        fn start(self: *Self) void {
+        fn run(self: *Self) void {
             self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
             // start reading
             self.stream.read(self.buffer[self.tail .. self.tail + recv_chunk]);
@@ -75,30 +75,23 @@ test "echo server" {
     // Accepts single connection and closes.
     const Server = struct {
         const Self = @This();
-        loop: *io.Loop,
 
         listener: tcp.Listener = undefined,
         conn: Connection = undefined,
-
         closed: bool = false,
 
-        fn listen(self: *Self, address: *net.Address) !void {
-            self.listener = try tcp.Listener.init(self.loop, self, acceptCompleted, address);
+        fn run(self: *Self) void {
+            self.listener.bind(self, onAccept, onClose);
             self.listener.accept(); // TODO ovdje moze ici how: single multishot
         }
 
-        fn acceptCompleted(self: *Self, socket_: io.Error!os.socket_t) void {
-            var socket = socket_ catch unreachable;
-            self.conn = .{ .stream = self.listener.stream(socket) };
-            self.conn.start();
-            self.close();
+        fn onAccept(self: *Self, stream: tcp.Stream) void {
+            self.conn = .{ .stream = stream };
+            self.conn.run();
+            self.listener.close();
         }
 
-        fn close(self: *Self) void {
-            self.listener.close(self, closeCompleted);
-        }
-
-        fn closeCompleted(self: *Self, _: io.Error!void) void {
+        fn onClose(self: *Self) void {
             self.closed = true;
         }
     };
@@ -109,10 +102,8 @@ test "echo server" {
     // When finished sending closes write part, and waits for read part to be closed.
     const Client = struct {
         const Self = @This();
-        loop: *io.Loop,
-        socket: os.socket_t,
-        stream: tcp.Stream = undefined,
 
+        stream: tcp.Stream = undefined,
         reader_buffer: [buffer_len * 3]u8 = undefined,
         reader_pos: usize = 0,
 
@@ -121,11 +112,8 @@ test "echo server" {
 
         closed: bool = false,
 
-        fn connect(self: *Self) !void {
-            // TODO: gdje je dobro mjesto za ovu inicijalizaciju
-            self.stream = tcp.Stream.init(self.loop, self.socket);
+        fn run(self: *Self) void {
             self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
-
             self.stream.write(self.writer_buffer[self.writer_pos .. self.writer_pos + send_chunk]);
             self.stream.read(self.reader_buffer[self.reader_pos..]);
         }
@@ -169,17 +157,22 @@ test "echo server" {
     // server
     var server_loop = try io.Loop.init(.{});
     defer server_loop.deinit();
+
     var address = try net.Address.parseIp4("127.0.0.1", 0);
-    var server = Server{ .loop = &server_loop };
-    try server.listen(&address);
+    var server = Server{
+        .listener = try tcp.Listener.init(&server_loop, &address),
+    };
+    server.run();
 
     // client
     var client_loop = try io.Loop.init(.{});
     defer client_loop.deinit();
 
-    var ts = try std.net.tcpConnectToAddress(address);
-    var client = Client{ .loop = &client_loop, .writer_buffer = &buffer, .socket = ts.handle };
-    try client.connect();
+    var client = Client{
+        .stream = try tcp.Stream.initConnect(&client_loop, address),
+        .writer_buffer = &buffer,
+    };
+    client.run();
 
     // start client in another thread
     const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &client_loop, io.Loop.RunMode.until_done });

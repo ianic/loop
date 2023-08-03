@@ -13,18 +13,61 @@ const errno = @import("errno.zig");
 
 pub const Listener = struct {
     loop: *Loop,
-    completion: Completion,
+    socket: os.socket_t,
 
-    pub fn init(
-        loop: *Loop,
-        context: anytype,
-        comptime callback: fn (context: @TypeOf(context), socket: Error!os.socket_t) void,
-        address: *net.Address,
-    ) !Listener {
+    completion: Completion = undefined,
+    context: *anyopaque = undefined,
+    err: ?anyerror = null,
+
+    pub fn init(loop: *Loop, address: *net.Address) !Listener {
         const socket = try listen(address);
-        return .{
-            .loop = loop,
-            .completion = Completion.accept(context, callback, socket),
+        return Listener{ .loop = loop, .socket = socket };
+    }
+
+    pub fn bind(
+        self: *Listener,
+        context: anytype,
+        comptime onAccept: fn (context: @TypeOf(context), Stream) void,
+        comptime onClose: fn (context: @TypeOf(context)) void,
+    ) void {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = flags;
+                var listener: *Listener = @alignCast(@ptrCast(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(listener.context));
+                if (completion.args == .accept) {
+                    switch (ose) {
+                        .SUCCESS => {
+                            const socket = @as(os.socket_t, @intCast(res));
+                            const stream = Stream.init(listener.loop, socket);
+                            onAccept(ctx, stream);
+                        },
+                        // retry cases
+                        // reference: https://man7.org/linux/man-pages/man2/accept4.2.html
+                        .NETDOWN, .PROTO, .NOPROTOOPT, .HOSTDOWN, .NONET, .HOSTUNREACH, .OPNOTSUPP, .NETUNREACH => {
+                            // TODO: log this case
+                            listener.accept();
+                        },
+                        else => {
+                            listener.err = errno.toError(ose);
+                            listener.close();
+                        },
+                    }
+                    return;
+                }
+                if (completion.args == .close) {
+                    onClose(ctx);
+                    return;
+                }
+                unreachable;
+            }
+        };
+        self.context = context;
+        self.completion = .{
+            .args = .{ .accept = .{ .socket = self.socket } },
+            .context = self,
+            .complete = wrapper.complete,
         };
     }
 
@@ -33,19 +76,10 @@ pub const Listener = struct {
         self.loop.submit(&self.completion);
     }
 
-    pub fn stream(self: *Listener, socket: os.socket_t) Stream {
-        return Stream.init(self.loop, socket);
-    }
-
-    pub fn close(
-        self: *Listener,
-        context: anytype,
-        comptime callback: fn (context: @TypeOf(context), result: Error!void) void,
-    ) void {
+    // changes completion from accept to close
+    pub fn close(self: *Listener) void {
         assert(self.completion.args == .accept);
-        assert(self.completion.ready());
-        const socket = self.completion.args.accept.socket;
-        self.completion = Completion.close(context, callback, socket);
+        self.completion.args = .{ .close = .{ .fd = self.socket } };
         self.loop.submit(&self.completion);
     }
 };
@@ -123,6 +157,10 @@ pub const Stream = struct {
 
     pub fn init(loop: *Loop, socket: os.socket_t) Stream {
         return .{ .loop = loop, .socket = socket };
+    }
+
+    pub fn initConnect(loop: *Loop, address: net.Address) !Stream {
+        return Stream.init(loop, try connect(address));
     }
 
     pub fn bind(
@@ -331,4 +369,9 @@ pub fn listen(address: *net.Address) !os.socket_t {
         try os.getsockname(socket, &address.any, &slen);
     }
     return socket;
+}
+
+pub fn connect(address: net.Address) !os.socket_t {
+    const stream = try std.net.tcpConnectToAddress(address);
+    return stream.handle;
 }
