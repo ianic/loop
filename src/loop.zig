@@ -66,17 +66,47 @@ pub const Loop = struct {
 
         while (true) {
             if (self.active == 0) break;
-
-            try self.prep_submissions();
-            self.in_kernel += try self.ring.submit_and_wait(wait_nr);
-            const completed = try self.flush_completions(0);
-
+            const completed = try self.run_(wait_nr);
             switch (mode) {
                 .no_wait => break,
                 .once => if (completed > 0) break,
                 .until_done => {},
             }
         }
+    }
+
+    fn run_(self: *Loop, wait_nr: u32) !u32 {
+        try self.prep_submissions();
+        self.in_kernel += try self.ring.submit_and_wait(wait_nr);
+        return try self.flush_completions(0);
+    }
+
+    pub fn run_for_ns(self: *Loop, nsec: i64) !void {
+        try self.prep_timeout(nsec);
+        _ = try self.run_(1);
+    }
+
+    /// Prepare timeout so the loop runs at most 'nsec' nanoseconds.
+    /// The timeout will complete when either the timeout expires,
+    /// or any other event completes.
+    fn prep_timeout(self: *Loop, nsec: i64) !void {
+        const timeout_ts: os.linux.kernel_timespec = .{
+            .tv_sec = 0,
+            .tv_nsec = nsec,
+        };
+
+        var timeout_sqe: *linux.io_uring_sqe = undefined;
+        while (true) {
+            timeout_sqe = self.ring.get_sqe() catch {
+                // The submission queue is full, so flush submissions to make space.
+                self.in_kernel += try self.ring.submit();
+                continue;
+            };
+            break;
+        }
+        // Submit an relative timeout that will be canceled if any other SQE completes first.
+        linux.io_uring_prep_timeout(timeout_sqe, &timeout_ts, 1, 0);
+        timeout_sqe.user_data = 0; // No callback for timeout
     }
 
     fn prep_submissions(self: *Loop) !void {
@@ -99,12 +129,15 @@ pub const Loop = struct {
                 error.SignalInterrupt => continue,
                 else => return err,
             };
-            self.in_kernel -= len;
-            self.active -= len;
             no_completed += len;
             for (cqes[0..len]) |cqe| {
+                if (cqe.user_data == 0) continue; // Timeout cqe
+
+                self.in_kernel -= 1;
+                self.active -= 1;
                 // call completion callback
                 const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                // std.debug.print("completed {d} {d} {} {d}\n", .{ self.active, cqe.user_data, completion.args, cqe.res });
                 completion.completed(cqe.err(), cqe.res, cqe.flags);
             }
             if (len < cqes.len) return no_completed;
