@@ -124,6 +124,10 @@ test "echo server" {
                 return;
             }
             self.reader_pos += no_bytes;
+            if (self.reader_pos >= self.writer_buffer.len) {
+                self.stream.close();
+                return;
+            }
             self.stream.read(self.reader_buffer[self.reader_pos..]);
         }
 
@@ -134,7 +138,7 @@ test "echo server" {
             self.writer_pos += no_bytes;
 
             if (self.writer_pos >= self.writer_buffer.len) {
-                self.stream.writeShutdown();
+                //self.stream.writeShutdown();
                 return;
             }
 
@@ -180,8 +184,7 @@ test "echo server" {
     try testing.expect(conn.stream.reader.closed());
     try testing.expect(conn.stream.reader.err.? == error.EOF);
 
-    try testing.expect(client.stream.reader.err != null);
-    try testing.expect(client.stream.reader.err.? == error.EOF);
+    try testing.expect(client.stream.reader.err == null);
     try testing.expect(client.stream.writer.err == null);
 
     // expect buffer echoed back to the client
@@ -221,7 +224,7 @@ test "connects/disconnects" {
             if (no_bytes == 0) {
                 self.stream.close();
             }
-            print("\nonRead {d}\n", .{no_bytes});
+            // print("\nonRead {d}\n", .{no_bytes});
         }
 
         fn onWrite(self: *Self, no_bytes: usize) void {
@@ -230,7 +233,8 @@ test "connects/disconnects" {
         }
 
         fn onClose(self: *Self, err: ?anyerror) void {
-            print("onClose {?}\n", .{err});
+            _ = err;
+            // print("onClose {?}\n", .{err});
             self.closed = true;
         }
     };
@@ -281,7 +285,7 @@ test "connects/disconnects" {
     try testing.expect(server.conn.closed);
 }
 
-test "connects and waits" {
+test "how to close inactive connection" {
     const Connection = struct {
         const Self = @This();
 
@@ -296,32 +300,26 @@ test "connects and waits" {
 
         fn run(self: *Self) void {
             self.stream.bind(self, onRead, onWrite, onClose);
-            // self.stream.write(&self.buffer);
             self.stream.read(&self.buffer);
         }
 
         // when read completed
         // start new read until client signals no more data (shutdown of his write stream)
         fn onRead(self: *Self, no_bytes: usize) void {
-            _ = self;
             if (no_bytes == 0) {
-                // self.stream.shutdown();
+                self.stream.close();
             }
-            print("onRead {d}\n", .{no_bytes});
+            //print("onRead {d}\n", .{no_bytes});
         }
 
         fn onWrite(self: *Self, no_bytes: usize) void {
-            self.written += no_bytes;
-            print("onWrite {d} {d} {?}\n", .{ no_bytes, self.written, self.stream.writer.err });
-            if (no_bytes > 0) {
-                self.stream.write(&self.buffer);
-            } else {
-                self.stream.shutdown();
-            }
+            _ = no_bytes;
+            _ = self;
         }
 
         fn onClose(self: *Self, err: ?anyerror) void {
-            print("onClose {?}\n", .{err});
+            _ = err;
+            // print("onClose {?}\n", .{err});
             self.closed = true;
         }
     };
@@ -362,18 +360,14 @@ test "connects and waits" {
 
     // submit accept to kernel
     try server_loop.run(.no_wait);
-    // connect
+    // connect clinet which does nothing
     const stream = try std.net.tcpConnectToAddress(address);
     _ = stream;
     // get accept cqe, which creates connection and submits read to kernel
     try server_loop.run(.once);
-    // imagine nothing is hepening for looong time
-    server.conn.stream.readShutdown();
-    //server.conn.stream.close();
-    // std.os.close(server.conn.stream.socket);
-    //try std.os.shutdown(server.conn.stream.socket, .recv);
+    // imagine nothing is hepening for looong time and than we decide to close dangling connection
+    server.conn.stream.close();
     try server_loop.run(.until_done);
 
     try testing.expect(server.conn.closed);
-    //print("address port {d}\n", .{address.getPort()});
 }

@@ -159,6 +159,16 @@ pub const Stream = struct {
     context: *anyopaque = undefined,
     err: ?anyerror = null,
 
+    state: State = .initial,
+
+    const State = enum {
+        initial,
+        connected,
+        shutdown,
+        closing,
+        closed,
+    };
+
     pub fn init(loop: *Loop, socket: os.socket_t) Stream {
         return .{ .loop = loop, .socket = socket };
     }
@@ -172,7 +182,6 @@ pub const Stream = struct {
         context: anytype,
         comptime onRead: fn (context: @TypeOf(context), usize) void,
         comptime onWrite: fn (context: @TypeOf(context), usize) void,
-        // comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
         comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
     ) void {
         self.reader = Recv{ .loop = self.loop };
@@ -181,6 +190,7 @@ pub const Stream = struct {
         self.reader.bind(self.socket, context, onRead);
         self.writer.bind(self.socket, context, onWrite);
         self.bind_(context, onClose);
+        self.state = .connected;
     }
 
     fn bind_(
@@ -198,10 +208,11 @@ pub const Stream = struct {
                 var ctx: Context = @alignCast(@ptrCast(stream.context));
                 const err: ?anyerror = if (ose == .SUCCESS) null else errno.toError(ose);
                 if (completion.args == .shutdown) {
-                    // onShutdown(ctx, err);
+                    stream.close_();
                     return;
                 }
                 if (completion.args == .close) {
+                    stream.state = .closed;
                     onClose(ctx, err);
                     return;
                 }
@@ -236,18 +247,6 @@ pub const Stream = struct {
         return self.reader.closed();
     }
 
-    pub fn shutdown(self: *Stream) void {
-        self.shutdown_(.send);
-    }
-
-    pub fn readShutdown(self: *Stream) void {
-        self.shutdown_(.recv);
-    }
-
-    pub fn writeShutdown(self: *Stream) void {
-        self.shutdown_(.send);
-    }
-
     fn shutdown_(self: *Stream, how: os.ShutdownHow) void {
         assert(self.completion.ready());
         self.completion.args = .{ .shutdown = .{ .socket = self.socket, .how = how } };
@@ -255,9 +254,19 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        if (self.state != .connected) return;
+        assert(self.state == .connected);
+        self.state = .shutdown;
+        self.shutdown_(.both);
+    }
+
+    fn close_(self: *Stream) void {
         assert(self.completion.ready());
+        assert(self.state == .shutdown);
+
         self.completion.args = .{ .close = .{ .fd = self.socket } };
         self.loop.submit(&self.completion);
+        self.state = .closing;
     }
 };
 
