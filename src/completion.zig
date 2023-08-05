@@ -54,6 +54,9 @@ pub const Completion = struct {
             socket: os.socket_t,
             how: os.ShutdownHow,
         },
+        cancel: struct {
+            user_data: u64,
+        },
     };
 
     const State = enum {
@@ -102,6 +105,9 @@ pub const Completion = struct {
             },
             .shutdown => |args| {
                 linux.io_uring_prep_shutdown(sqe, args.socket, @intFromEnum(args.how));
+            },
+            .cancel => |args| {
+                linux.io_uring_prep_cancel(sqe, args.user_data, linux.IORING_ASYNC_CANCEL_ALL);
             },
         }
         sqe.user_data = @intFromPtr(self);
