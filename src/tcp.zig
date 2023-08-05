@@ -155,6 +155,10 @@ pub const Stream = struct {
     reader: Recv = undefined,
     writer: Send = undefined,
 
+    completion: Completion = undefined,
+    context: *anyopaque = undefined,
+    err: ?anyerror = null,
+
     pub fn init(loop: *Loop, socket: os.socket_t) Stream {
         return .{ .loop = loop, .socket = socket };
     }
@@ -168,13 +172,48 @@ pub const Stream = struct {
         context: anytype,
         comptime onRead: fn (context: @TypeOf(context), usize) void,
         comptime onWrite: fn (context: @TypeOf(context), usize) void,
-        comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
+        // comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
         comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
     ) void {
         self.reader = Recv{ .loop = self.loop };
-        self.reader.bind(self.socket, context, onRead);
         self.writer = Send{ .loop = self.loop };
-        self.writer.bind(self.socket, context, onWrite, onShutdown, onClose);
+
+        self.reader.bind(self.socket, context, onRead);
+        self.writer.bind(self.socket, context, onWrite);
+        self.bind_(context, onClose);
+    }
+
+    fn bind_(
+        self: *Stream,
+        context: anytype,
+        // comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
+        comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
+    ) void {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, ose: os.E, res: i32, flags: u32) void {
+                _ = res;
+                _ = flags;
+                var stream: *Stream = @alignCast(@ptrCast(completion.context));
+                var ctx: Context = @alignCast(@ptrCast(stream.context));
+                const err: ?anyerror = if (ose == .SUCCESS) null else errno.toError(ose);
+                if (completion.args == .shutdown) {
+                    // onShutdown(ctx, err);
+                    return;
+                }
+                if (completion.args == .close) {
+                    onClose(ctx, err);
+                    return;
+                }
+                unreachable;
+            }
+        };
+        self.context = context;
+        self.completion = .{
+            .args = .{ .shutdown = .{ .socket = self.socket, .how = .send } },
+            .context = self,
+            .complete = wrapper.complete,
+        };
     }
 
     pub fn write(self: *Stream, buffer: []const u8) void {
@@ -198,11 +237,27 @@ pub const Stream = struct {
     }
 
     pub fn shutdown(self: *Stream) void {
-        self.writer.shutdown();
+        self.shutdown_(.send);
+    }
+
+    pub fn readShutdown(self: *Stream) void {
+        self.shutdown_(.recv);
+    }
+
+    pub fn writeShutdown(self: *Stream) void {
+        self.shutdown_(.send);
+    }
+
+    fn shutdown_(self: *Stream, how: os.ShutdownHow) void {
+        assert(self.completion.ready());
+        self.completion.args = .{ .shutdown = .{ .socket = self.socket, .how = how } };
+        self.loop.submit(&self.completion);
     }
 
     pub fn close(self: *Stream) void {
-        self.writer.close();
+        assert(self.completion.ready());
+        self.completion.args = .{ .close = .{ .fd = self.socket } };
+        self.loop.submit(&self.completion);
     }
 };
 
@@ -218,8 +273,6 @@ pub const Send = struct {
         socket: os.socket_t,
         context: anytype,
         comptime onWrite: fn (context: @TypeOf(context), usize) void,
-        comptime onShutdown: fn (context: @TypeOf(context), ?anyerror) void,
-        comptime onClose: fn (context: @TypeOf(context), ?anyerror) void,
     ) void {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -228,29 +281,19 @@ pub const Send = struct {
                 var send: *Send = @alignCast(@ptrCast(completion.context));
                 var ctx: Context = @alignCast(@ptrCast(send.context));
                 const err: ?anyerror = if (ose == .SUCCESS) null else errno.toError(ose);
-                if (completion.args == .shutdown) {
-                    onShutdown(ctx, err);
-                    return;
-                }
-                if (completion.args == .close) {
-                    onClose(ctx, err);
-                    return;
-                }
-                if (completion.args == .send) {
-                    if (ose == .SUCCESS) {
-                        const no_bytes: usize = @intCast(res);
-                        if (no_bytes == 0) {
-                            // TODO treba li ovo
-                            send.err = error.EOF;
-                        }
-                        onWrite(ctx, no_bytes);
-                    } else {
-                        send.err = errno.toError(ose);
-                        onWrite(ctx, 0);
+                _ = err;
+                if (ose == .SUCCESS) {
+                    const no_bytes: usize = @intCast(res);
+                    if (no_bytes == 0) {
+                        // TODO treba li ovo
+                        send.err = error.EOF;
                     }
-                    return;
+                    onWrite(ctx, no_bytes);
+                } else {
+                    send.err = errno.toError(ose);
+                    onWrite(ctx, 0);
                 }
-                unreachable;
+                return;
             }
         };
         self.context = context;
@@ -258,18 +301,6 @@ pub const Send = struct {
             .args = .{ .send = .{ .socket = socket, .buffer = undefined } },
             .context = self,
             .complete = wrapper.complete,
-        };
-    }
-
-    pub fn init(
-        loop: *Loop,
-        context: anytype,
-        comptime callback: fn (context: @TypeOf(context), no_bytes: Error!usize) void,
-        socket: os.socket_t,
-    ) Send {
-        return .{
-            .loop = loop,
-            .completion = Completion.send(context, callback, socket),
         };
     }
 
@@ -281,23 +312,6 @@ pub const Send = struct {
 
     pub fn ready(self: *Send) bool {
         return self.completion.args == .send and self.completion.ready();
-    }
-
-    // changes completion from send to shutdown and submits completion
-    // can't use completion after this
-    pub fn shutdown(self: *Send) void {
-        assert(self.completion.args == .send);
-        const socket = self.completion.args.send.socket;
-        self.completion.args = .{ .shutdown = .{ .socket = socket, .how = .send } };
-        self.loop.submit(&self.completion);
-    }
-
-    // changes completion from shutdown to close
-    pub fn close(self: *Send) void {
-        assert(self.completion.args == .shutdown);
-        const socket = self.completion.args.shutdown.socket;
-        self.completion.args = .{ .close = .{ .fd = socket } };
-        self.loop.submit(&self.completion);
     }
 };
 

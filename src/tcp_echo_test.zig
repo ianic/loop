@@ -29,8 +29,12 @@ test "echo server" {
 
         closed: bool = false,
 
+        fn init(stream: tcp.Stream) Self {
+            return .{ .stream = stream };
+        }
+
         fn run(self: *Self) void {
-            self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
+            self.stream.bind(self, onRead, onWrite, onClose);
             // start reading
             self.stream.read(self.buffer[self.tail .. self.tail + recv_chunk]);
         }
@@ -49,7 +53,7 @@ test "echo server" {
             if (!self.stream.writeReady()) return;
             if (self.head == self.tail) {
                 if (self.stream.readClosed())
-                    self.stream.shutdown();
+                    self.stream.close();
                 return;
             }
             self.stream.write(self.buffer[self.head..self.tail]);
@@ -61,10 +65,6 @@ test "echo server" {
             }
             self.head += no_bytes;
             self.tryWrite();
-        }
-
-        fn onShutdown(self: *Self, _: ?anyerror) void {
-            self.stream.close();
         }
 
         fn onClose(self: *Self, _: ?anyerror) void {
@@ -86,7 +86,7 @@ test "echo server" {
         }
 
         fn onAccept(self: *Self, stream: tcp.Stream) void {
-            self.conn = .{ .stream = stream };
+            self.conn = Connection.init(stream);
             self.conn.run();
             self.listener.close();
         }
@@ -113,7 +113,7 @@ test "echo server" {
         closed: bool = false,
 
         fn run(self: *Self) void {
-            self.stream.bind(self, onRead, onWrite, onShutdown, onClose);
+            self.stream.bind(self, onRead, onWrite, onClose);
             self.stream.write(self.writer_buffer[self.writer_pos .. self.writer_pos + send_chunk]);
             self.stream.read(self.reader_buffer[self.reader_pos..]);
         }
@@ -134,17 +134,13 @@ test "echo server" {
             self.writer_pos += no_bytes;
 
             if (self.writer_pos >= self.writer_buffer.len) {
-                self.stream.shutdown();
+                self.stream.writeShutdown();
                 return;
             }
 
             var to = self.writer_pos + send_chunk;
             if (to > self.writer_buffer.len) to = self.writer_buffer.len;
             self.stream.write(self.writer_buffer[self.writer_pos..to]);
-        }
-
-        fn onShutdown(self: *Self, _: ?anyerror) void {
-            _ = self;
         }
 
         fn onClose(self: *Self, _: ?anyerror) void {
@@ -199,4 +195,185 @@ test "echo server" {
     try testing.expect(client.closed);
     try testing.expect(conn.closed);
     try testing.expect(server.closed);
+}
+
+test "connects/disconnects" {
+    const Connection = struct {
+        const Self = @This();
+
+        stream: tcp.Stream = undefined,
+        buffer: [1024]u8 = undefined,
+        closed: bool = false,
+
+        fn init(stream: tcp.Stream) Self {
+            return .{ .stream = stream };
+        }
+
+        fn run(self: *Self) void {
+            self.stream.bind(self, onRead, onWrite, onClose);
+            // start reading
+            self.stream.read(&self.buffer);
+        }
+
+        // when read completed
+        // start new read until client signals no more data (shutdown of his write stream)
+        fn onRead(self: *Self, no_bytes: usize) void {
+            if (no_bytes == 0) {
+                self.stream.close();
+            }
+            print("\nonRead {d}\n", .{no_bytes});
+        }
+
+        fn onWrite(self: *Self, no_bytes: usize) void {
+            _ = no_bytes;
+            _ = self;
+        }
+
+        fn onClose(self: *Self, err: ?anyerror) void {
+            print("onClose {?}\n", .{err});
+            self.closed = true;
+        }
+    };
+
+    // Accepts single connection and closes.
+    const Server = struct {
+        const Self = @This();
+
+        listener: tcp.Listener = undefined,
+        conn: Connection = undefined,
+        closed: bool = false,
+
+        fn run(self: *Self) void {
+            self.listener.bind(self, onAccept, onClose);
+            self.listener.accept(); // TODO ovdje moze ici how: single multishot
+        }
+
+        fn onAccept(self: *Self, stream: tcp.Stream) void {
+            self.conn = Connection.init(stream);
+            self.conn.run();
+            self.listener.close();
+        }
+
+        fn onClose(self: *Self) void {
+            self.closed = true;
+        }
+    };
+
+    // server
+    var server_loop = try io.Loop.init(.{});
+    defer server_loop.deinit();
+
+    var address = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = Server{
+        .listener = try tcp.Listener.init(&server_loop, &address),
+    };
+    server.run();
+
+    // start server in another thread
+    const thr = try std.Thread.spawn(.{}, io.Loop.run, .{ &server_loop, io.Loop.RunMode.until_done });
+
+    const stream = try std.net.tcpConnectToAddress(address);
+    // any of these two is ok, not need both
+    try std.os.shutdown(stream.handle, .send);
+    stream.close();
+    thr.join();
+
+    try testing.expect(server.conn.closed);
+}
+
+test "connects and waits" {
+    const Connection = struct {
+        const Self = @This();
+
+        stream: tcp.Stream = undefined,
+        buffer: [16]u8 = undefined,
+        written: usize = 0,
+        closed: bool = false,
+
+        fn init(stream: tcp.Stream) Self {
+            return .{ .stream = stream };
+        }
+
+        fn run(self: *Self) void {
+            self.stream.bind(self, onRead, onWrite, onClose);
+            // self.stream.write(&self.buffer);
+            self.stream.read(&self.buffer);
+        }
+
+        // when read completed
+        // start new read until client signals no more data (shutdown of his write stream)
+        fn onRead(self: *Self, no_bytes: usize) void {
+            _ = self;
+            if (no_bytes == 0) {
+                // self.stream.shutdown();
+            }
+            print("onRead {d}\n", .{no_bytes});
+        }
+
+        fn onWrite(self: *Self, no_bytes: usize) void {
+            self.written += no_bytes;
+            print("onWrite {d} {d} {?}\n", .{ no_bytes, self.written, self.stream.writer.err });
+            if (no_bytes > 0) {
+                self.stream.write(&self.buffer);
+            } else {
+                self.stream.shutdown();
+            }
+        }
+
+        fn onClose(self: *Self, err: ?anyerror) void {
+            print("onClose {?}\n", .{err});
+            self.closed = true;
+        }
+    };
+
+    // Accepts single connection and closes.
+    const Server = struct {
+        const Self = @This();
+
+        listener: tcp.Listener = undefined,
+        conn: Connection = undefined,
+        closed: bool = false,
+
+        fn run(self: *Self) void {
+            self.listener.bind(self, onAccept, onClose);
+            self.listener.accept(); // TODO ovdje moze ici how: single multishot
+        }
+
+        fn onAccept(self: *Self, stream: tcp.Stream) void {
+            self.conn = Connection.init(stream);
+            self.conn.run();
+            self.listener.close();
+        }
+
+        fn onClose(self: *Self) void {
+            self.closed = true;
+        }
+    };
+
+    // server
+    var server_loop = try io.Loop.init(.{});
+    defer server_loop.deinit();
+
+    var address = try net.Address.parseIp4("127.0.0.1", 0);
+    var server = Server{
+        .listener = try tcp.Listener.init(&server_loop, &address),
+    };
+    server.run();
+
+    // submit accept to kernel
+    try server_loop.run(.no_wait);
+    // connect
+    const stream = try std.net.tcpConnectToAddress(address);
+    _ = stream;
+    // get accept cqe, which creates connection and submits read to kernel
+    try server_loop.run(.once);
+    // imagine nothing is hepening for looong time
+    server.conn.stream.readShutdown();
+    //server.conn.stream.close();
+    // std.os.close(server.conn.stream.socket);
+    //try std.os.shutdown(server.conn.stream.socket, .recv);
+    try server_loop.run(.until_done);
+
+    try testing.expect(server.conn.closed);
+    //print("address port {d}\n", .{address.getPort()});
 }
