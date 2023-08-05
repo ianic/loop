@@ -137,7 +137,6 @@ pub const Loop = struct {
                 self.active -= 1;
                 // call completion callback
                 const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                // std.debug.print("completed {d} {d} {} {d}\n", .{ self.active, cqe.user_data, completion.args, cqe.res });
                 completion.completed(cqe.err(), cqe.res, cqe.flags);
             }
             if (len < cqes.len) return no_completed;
